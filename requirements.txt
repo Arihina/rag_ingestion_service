@@ -1,0 +1,29 @@
+# Загрузчик и HTTP-слой. docling здесь нет: он живёт в своём контейнере,
+# общение с ним идёт по HTTP, а веса и torch лежат в его образе.
+#
+# ВАЖНО про torch. FlagEmbedding подтянет torch с дефолтного индекса PyPI,
+# а для RTX 5070 Ti (Blackwell, sm_120) нужна сборка с CUDA >= 12.8.
+# Поставь torch ПЕРВЫМ и явно, иначе получишь тот же
+# "no kernel image is available for execution on the device", что и в docling:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements.txt
+
+# --- HTTP-клиент к docling-serve ---
+httpx
+
+# --- эмбеддинги ---
+# BGEM3FlagModel: dense + lexical_weights из одного прохода
+FlagEmbedding
+
+# --- OpenSearch ---
+# async-клиент и helpers.async_bulk
+opensearch-py[async]
+
+# --- HTTP-слой загрузки ---
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+# нужен FastAPI для multipart-загрузки файлов (UploadFile)
+python-multipart
