@@ -1,0 +1,99 @@
+# Запуск: docker compose -f docker-compose.prod.yml up -d
+# Требует .env с DOCLING_KEY, OPENSEARCH_PASSWORD, DOCLING_IMAGE.
+#
+# Образ здесь не собирается — приезжает из реестра, собранный в CI.
+# По-хорошему пинить не по тегу, а по digest: тег можно молча перезаписать.
+
+x-docling-common: &docling-common
+  image: ${DOCLING_IMAGE:?set DOCLING_IMAGE, e.g. registry.internal/docling-serve@sha256:...}
+  restart: unless-stopped
+  environment: &docling-env
+    DOCLING_SERVE_ARTIFACTS_PATH: /opt/app-root/src/models
+    DOCLING_DEVICE: cuda:0
+    DOCLING_NUM_THREADS: "8"
+    DOCLING_SERVE_ENG_KIND: rq
+    DOCLING_SERVE_ENG_RQ_REDIS_URL: redis://redis:6379/0
+    # Жёсткая гарантия, что в рантайме ничего не полезет в сеть.
+    HF_HUB_OFFLINE: "1"
+  depends_on:
+    redis:
+      condition: service_healthy
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:3.5.0
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_PASSWORD:?required}
+      - bootstrap.memory_lock=true
+      # Половина RAM ноды, но не выше ~31g — за этой границей JVM
+      # теряет сжатые указатели и heap начинает работать хуже.
+      - "OPENSEARCH_JAVA_OPTS=-Xms16g -Xmx16g"
+      - knn.memory.circuit_breaker.limit=60%
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+      # TLS-сертификаты и security-конфиг монтируются снаружи.
+      - ./opensearch/certs:/usr/share/opensearch/config/certs:ro
+    expose:
+      - "9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sfk https://localhost:9200/_cluster/health -u admin:${OPENSEARCH_PASSWORD} || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  docling-api:
+    <<: *docling-common
+    environment:
+      <<: *docling-env
+      DOCLING_SERVE_ENABLE_UI: "false"
+      DOCLING_SERVE_API_KEY: ${DOCLING_KEY:?required}
+    expose:
+      - "5001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  # API принимает задачи, но без воркеров никто их не выполнит —
+  # снаружи это выглядит как вечный pending.
+  docling-worker:
+    <<: *docling-common
+    command: ["docling-serve", "rq-worker"]
+    deploy:
+      replicas: 3
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  opensearch-data:
+  redis-data:

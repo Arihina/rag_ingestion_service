@@ -1,0 +1,85 @@
+# Запуск: docker compose -f docker-compose.dev.yml up -d --build
+# Все порты биндятся на 127.0.0.1 — наружу ничего не торчит.
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:3.5.0
+    container_name: opensearch-rag
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Opensearch1!
+      - bootstrap.memory_lock=true
+      # 512m хватало на e5-small; с 1024-мерными векторами bge-m3
+      # и bulk-загрузкой пачками этого мало даже в деве.
+      - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
+      # HNSW-графы живут вне heap — этот лимит отдельный.
+      - knn.memory.circuit_breaker.limit=60%
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "127.0.0.1:9200:9200"
+      - "127.0.0.1:9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:3.5.0
+    container_name: opensearch-dashboards-dev
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "127.0.0.1:5601:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  docling:
+    build:
+      context: .
+      args:
+        DOCLING_BASE: quay.io/docling-project/docling-serve-cu128:1.21.0
+    container_name: docling-serve-dev
+    environment:
+      DOCLING_SERVE_ARTIFACTS_PATH: /opt/app-root/src/models
+      DOCLING_DEVICE: cuda:0
+      DOCLING_NUM_THREADS: "4"
+      # UI на /ui: можно закинуть проблемный PDF руками и посмотреть,
+      # что вернули layout и OCR, не гоняя пайплайн целиком.
+      DOCLING_SERVE_ENABLE_UI: "true"
+      DOCLING_SERVE_ENG_KIND: local
+      # HF_HUB_OFFLINE намеренно не выставлен: пока подбираешь пресеты OCR,
+      # удобно, чтобы недостающее докачивалось само.
+    ports:
+      - "127.0.0.1:5001:5001"
+    volumes:
+      # Кэш моделей переживает пересборку образа.
+      - docling-hf-cache:/opt/app-root/src/.cache/huggingface
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  opensearch-data:
+  docling-hf-cache:
