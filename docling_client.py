@@ -69,6 +69,19 @@ class ConversionOptions:
             out["pdf_backend"] = self.pdf_backend
         return out
 
+    def as_form_data(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "do_ocr": str(self.do_ocr).lower(),
+            "force_ocr": str(self.force_ocr).lower(),
+            "table_mode": self.table_mode,
+            "ocr_lang": list(self.ocr_lang),  # список -> повторяющиеся поля
+        }
+        if self.ocr_preset:
+            data["ocr_preset"] = self.ocr_preset
+        if self.pdf_backend:
+            data["pdf_backend"] = self.pdf_backend
+        return data
+
 
 @dataclass(frozen=True)
 class ChunkingOptions:
@@ -92,6 +105,13 @@ class ChunkingOptions:
             f"{self._PREFIX}tokenizer": self.tokenizer,
             f"{self._PREFIX}max_tokens": self.max_tokens,
             f"{self._PREFIX}merge_peers": self.merge_peers,
+        }
+    
+    def as_form_data(self) -> dict[str, Any]:
+        return {
+            f"{self._PREFIX}tokenizer": self.tokenizer,
+            f"{self._PREFIX}max_tokens": str(self.max_tokens),
+            f"{self._PREFIX}merge_peers": str(self.merge_peers).lower(),
         }
 
 
@@ -306,22 +326,18 @@ class BaseDoclingChunker(ABC):
 class FileDoclingChunker(BaseDoclingChunker):
     """Загрузка локального файла через multipart."""
 
-    async def _submit(
-        self,
-        source: Path | str,
-        conversion: ConversionOptions,
-        chunking: ChunkingOptions,
-    ) -> str:
+    async def _submit(self, source, conversion, chunking) -> str:
         path = Path(source)
-        data = conversion.as_form_fields() + chunking.as_form_fields()
+        data = {**conversion.as_form_data(), **chunking.as_form_data()}
 
-        with path.open("rb") as handle:
-            response = await self._client.post(
-                f"{self._base_url}{self.CHUNK_PATH}/file/async",
-                headers=self._headers,
-                files={"files": (path.name, handle)},
-                data=data,
-            )
+        payload = await asyncio.to_thread(path.read_bytes)
+
+        response = await self._client.post(
+            f"{self._base_url}{self.CHUNK_PATH}/file/async",
+            headers=self._headers,
+            files={"files": (path.name, payload, "application/octet-stream")},
+            data=data,
+        )
         response.raise_for_status()
         return response.json()["task_id"]
 
