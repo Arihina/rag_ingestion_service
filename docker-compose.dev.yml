@@ -1,5 +1,9 @@
 # Запуск: docker compose -f docker-compose.dev.yml up -d --build
 # Все порты биндятся на 127.0.0.1 — наружу ничего не торчит.
+#
+# Веса моделей живут на volume docling-models, а не в образе.
+# Пересборка образа их не трогает: docker compose build --no-cache
+# перестаёт стоить полчаса и десятки гигабайт.
 
 services:
   opensearch:
@@ -13,7 +17,8 @@ services:
       # 512m хватало на e5-small; с 1024-мерными векторами bge-m3
       # и bulk-загрузкой пачками этого мало даже в деве.
       - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
-      # HNSW-графы живут вне heap — этот лимит отдельный.
+      # HNSW-графы живут вне heap — этот лимит отдельный,
+      # и считается он от памяти контейнера, отсюда mem_limit ниже.
       - knn.memory.circuit_breaker.limit=60%
     ulimits:
       memlock:
@@ -22,6 +27,7 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    mem_limit: 8g
     ports:
       - "127.0.0.1:9200:9200"
       - "127.0.0.1:9600:9600"
@@ -45,6 +51,28 @@ services:
       opensearch:
         condition: service_healthy
 
+  # Одноразовый: наполняет volume и завершается.
+  # Повторный up видит уже скачанное и проходит мгновенно.
+  docling-models-init:
+    build:
+      context: .
+      args:
+        DOCLING_BASE: ghcr.io/docling-project/docling-serve-cu128:v1.21.0
+    container_name: docling-models-init
+    user: "0"
+    environment:
+      HF_HOME: /models/hf
+    entrypoint: ["/bin/bash", "-lc"]
+    command: >
+      set -e;
+      docling-tools models download -o /models/docling layout tableformer;
+      python -c "from transformers import AutoTokenizer;
+                 AutoTokenizer.from_pretrained('BAAI/bge-m3')";
+      chown -R 1001:0 /models
+    volumes:
+      - docling-models:/models
+    restart: "no"
+
   docling:
     build:
       context: .
@@ -52,20 +80,23 @@ services:
         DOCLING_BASE: ghcr.io/docling-project/docling-serve-cu128:v1.21.0
     container_name: docling-serve-dev
     environment:
-      DOCLING_SERVE_ARTIFACTS_PATH: /opt/app-root/src/models
+      DOCLING_SERVE_ARTIFACTS_PATH: /models/docling
+      HF_HOME: /models/hf
       DOCLING_DEVICE: cuda:0
       DOCLING_NUM_THREADS: "4"
       # UI на /ui: можно закинуть проблемный PDF руками и посмотреть,
       # что вернули layout и OCR, не гоняя пайплайн целиком.
       DOCLING_SERVE_ENABLE_UI: "true"
       DOCLING_SERVE_ENG_KIND: local
-      # HF_HUB_OFFLINE намеренно не выставлен: пока подбираешь пресеты OCR,
-      # удобно, чтобы недостающее докачивалось само.
+      # HF_HUB_OFFLINE намеренно не выставлен: модели RapidOCR под eslav
+      # докачиваются в рантайме при первом OCR (см. README).
     ports:
       - "127.0.0.1:5001:5001"
     volumes:
-      # Кэш моделей переживает пересборку образа.
-      - docling-hf-cache:/opt/app-root/src/.cache/huggingface
+      - docling-models:/models
+    depends_on:
+      docling-models-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1"]
       interval: 30s
@@ -82,4 +113,4 @@ services:
 
 volumes:
   opensearch-data:
-  docling-hf-cache:
+  docling-models:

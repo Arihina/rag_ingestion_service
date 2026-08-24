@@ -8,18 +8,17 @@ FROM ${DOCLING_BASE}
 
 USER 0
 
-ENV HF_HOME=/opt/app-root/src/.cache/huggingface \
-    DOCLING_SERVE_ARTIFACTS_PATH=/opt/app-root/src/models
-
-RUN pip install --no-cache-dir "rapidocr>=3.9.1"
-
-RUN docling-tools models download --all -o /opt/app-root/src/models
-
-RUN python -c "from transformers import AutoTokenizer; \
-    AutoTokenizer.from_pretrained('BAAI/bge-m3')"
-
-RUN chown -R 1001:0 /opt/app-root/src
+# Единственная правка образа. Явная зачистка нужна даже с --no-cache-dir:
+# pip оставляет собранные колёса, если пакет ставился из sdist.
+RUN pip install --no-cache-dir "rapidocr>=3.9.1" \
+ && rm -rf /root/.cache /tmp/* /var/tmp/*
 
 USER 1001
+
+# Весов в образе НЕТ. Иначе каждая пересборка порождает новый набор
+# многогигабайтных слоёв, и они копятся, пока не съедят диск.
+# Каталоги наполняет одноразовый сервис docling-models-init.
+ENV HF_HOME=/models/hf \
+    DOCLING_SERVE_ARTIFACTS_PATH=/models/docling
 
 EXPOSE 5001
