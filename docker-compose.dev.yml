@@ -49,7 +49,7 @@ services:
     build:
       context: .
       args:
-        DOCLING_BASE: quay.io/docling-project/docling-serve-cu128:1.21.0
+        DOCLING_BASE: ghcr.io/docling-project/docling-serve-cu128:v1.21.0
     container_name: docling-serve-dev
     environment:
       DOCLING_SERVE_ARTIFACTS_PATH: /opt/app-root/src/models
