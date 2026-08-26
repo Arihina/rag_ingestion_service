@@ -1,22 +1,18 @@
-"""Тонкий HTTP-слой поверх IngestPipeline.
-
-Сервис существует ради двух вещей:
-
-  1. Загрузка. Принять файл, отдать его в docling, посчитать эмбеддинги,
-     положить в OpenSearch. Долгая работа уходит в фон, клиент получает job_id.
-
-  2. Симметрия. Эндпоинт /embed отдаёт вектор тем же экземпляром bge-m3,
-     который считал векторы документов. Поисковому бэкенду не нужен ни torch,
-     ни GPU, а вектор запроса физически не может разойтись с индексом.
-
-Модель грузится один раз на старте — инициализация bge-m3 не мгновенная,
-и делать её на каждый запрос недопустимо.
+"""
+Два назначения:
+  1. Загрузка. Принять файл, отдать в docling, посчитать эмбеддинги,
+     положить в OpenSearch. Долгая работа уходит в фон.
+  2. Симметрия. /embed отдаёт вектор тем же экземпляром bge-m3, который
+     считал векторы документов. Поисковому бэкенду не нужен ни torch,
+     ни GPU, а вектор запроса не может разойтись с индексом.
+Модель грузится один раз на старте: инициализация bge-m3 не мгновенная.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import shutil
 import tempfile
 import uuid
@@ -27,20 +23,29 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    UploadFile,
+)
 from opensearchpy import AsyncOpenSearch
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from docling_client import ChunkingOptions, ConversionOptions, FileDoclingChunker
+from docling_client import ChunkingOptions, ConversionOptions, DoclingFileClient
 from rag_ingest import BgeM3Embedder, IngestPipeline, OpenSearchLoader
 
 logger = logging.getLogger(__name__)
 
 
-
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="INGEST_", env_file=".env")
+    model_config = SettingsConfigDict(
+        env_prefix="INGEST_", env_file="ingest.env", extra="ignore"
+    )
 
     docling_url: str = "http://localhost:5001"
     docling_api_key: str | None = None
@@ -56,12 +61,19 @@ class Settings(BaseSettings):
     embed_device: str | None = None
 
     chunk_max_tokens: int = 768
-    ocr_lang: str = "eslav"
+    ocr_engine: str = "easyocr"
+    ocr_lang: str = "ru,en"
+    force_ocr: bool = True
 
     api_key: str | None = None
     max_upload_mb: int = 200
-
     embed_concurrency: int = 1
+    max_pending_jobs: int = 50
+
+    allowed_suffixes: tuple[str, ...] = (
+        ".pdf", ".docx", ".pptx", ".xlsx", ".html", ".htm",
+        ".md", ".txt", ".csv", ".png", ".jpg", ".jpeg", ".tiff",
+    )
 
 
 settings = Settings()
@@ -82,18 +94,11 @@ class Job:
     chunks_loaded: int = 0
     error: str | None = None
     created_at: datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc)
-    )
+        default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
 
 
 class JobRegistry:
-    """Состояние задач в памяти процесса.
-
-    Переживает только текущий инстанс: после рестарта история теряется.
-    Для durable-очереди подключай тот же Redis, что и docling-serve.
-    """
-
     def __init__(self, max_entries: int = 1000) -> None:
         self._jobs: dict[str, Job] = {}
         self._max_entries = max_entries
@@ -107,12 +112,19 @@ class JobRegistry:
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
+    def pending_count(self) -> int:
+        return sum(
+            1
+            for j in self._jobs.values()
+            if j.status in (JobStatus.PENDING, JobStatus.RUNNING)
+        )
+
     def _evict(self) -> None:
         if len(self._jobs) <= self._max_entries:
             return
         finished = sorted(
             (j for j in self._jobs.values() if j.finished_at),
-            key=lambda j: j.finished_at,
+            key=lambda j: j.finished_at,  # type: ignore[arg-type]
         )
         for job in finished[: len(self._jobs) - self._max_entries]:
             self._jobs.pop(job.job_id, None)
@@ -155,11 +167,12 @@ class HealthResponse(BaseModel):
     docling: bool
     opensearch: bool
     model: str
+    pending_jobs: int
 
 
 class AppState:
     embedder: BgeM3Embedder
-    chunker: FileDoclingChunker
+    chunker: DoclingFileClient
     loader: OpenSearchLoader
     pipeline: IngestPipeline
     os_client: AsyncOpenSearch
@@ -192,14 +205,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.loader = OpenSearchLoader(state.os_client, settings.index_name)
     await state.loader.ensure_index()
 
-    state.chunker = FileDoclingChunker(
+    state.chunker = DoclingFileClient(
         settings.docling_url, api_key=settings.docling_api_key
     )
     state.pipeline = IngestPipeline(
         state.chunker,
         state.embedder,
         state.loader,
-        conversion=ConversionOptions(ocr_lang=(settings.ocr_lang,)),
+        conversion=ConversionOptions(
+            do_ocr=True,
+            force_ocr=settings.force_ocr,
+            ocr_engine=settings.ocr_engine,
+            ocr_lang=tuple(
+                lang.strip() for lang in settings.ocr_lang.split(",") if lang.strip()
+            ),
+        ),
         chunking=ChunkingOptions(
             tokenizer=settings.embed_model, max_tokens=settings.chunk_max_tokens
         ),
@@ -214,34 +234,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await state.os_client.close()
 
 
-app = FastAPI(title="RAG Ingest API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="RAG Ingest API", version="1.1.0", lifespan=lifespan)
 
 
 async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    if settings.api_key and x_api_key != settings.api_key:
+    if not settings.api_key:
+        return
+
+    if not x_api_key or not secrets.compare_digest(x_api_key, settings.api_key):
         raise HTTPException(
             status_code=401, detail="Неверный или отсутствующий ключ")
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    docling_ok = False
-    opensearch_ok = False
-    try:
-        response = await state.chunker._client.get(f"{settings.docling_url}/health")
-        docling_ok = response.status_code == 200
-    except Exception:
-        logger.warning("docling недоступен", exc_info=True)
+    docling_ok = await state.chunker.health()
     try:
         opensearch_ok = await state.os_client.ping()
     except Exception:
         logger.warning("opensearch недоступен", exc_info=True)
+        opensearch_ok = False
 
     return HealthResponse(
         status="ok" if (docling_ok and opensearch_ok) else "degraded",
         docling=docling_ok,
         opensearch=opensearch_ok,
         model=settings.embed_model,
+        pending_jobs=state.jobs.pending_count(),
     )
 
 
@@ -254,16 +273,28 @@ async def health() -> HealthResponse:
 async def ingest_file(
     background: BackgroundTasks, file: UploadFile = File(...)
 ) -> JobResponse:
-    """Принять файл и поставить его в обработку.
+    """Принять файл и поставить в обработку.
 
-    Отвечает сразу: конверсия PDF занимает секунды на страницу, держать
-    соединение открытым всё это время незачем.
+    Отвечает сразу: конверсия скана занимает секунды на страницу.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="Файл без имени")
 
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in settings.allowed_suffixes:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Расширение {suffix or '<нет>'} не поддерживается",
+        )
+
+    if state.jobs.pending_count() >= settings.max_pending_jobs:
+        raise HTTPException(
+            status_code=429,
+            detail=f"В очереди уже {settings.max_pending_jobs} задач, попробуйте позже",
+        )
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="ingest-"))
-    tmp_path = tmp_dir / file.filename
+    tmp_path = tmp_dir / Path(file.filename).name
     limit = settings.max_upload_mb * 1024 * 1024
     written = 0
 
@@ -311,9 +342,8 @@ async def embed(request: EmbedRequest) -> EmbedResponse:
 
     return EmbedResponse(
         model=settings.embed_model,
-        embeddings=[
-            EmbedItem(dense=r.dense, sparse=r.sparse) for r in results
-        ],
+        embeddings=[EmbedItem(dense=r.dense, sparse=r.sparse)
+                    for r in results],
     )
 
 
@@ -321,7 +351,9 @@ async def _run_ingest(job: Job, path: Path, tmp_dir: Path) -> None:
     job.status = JobStatus.RUNNING
     try:
         async with state.embed_sem:
-            job.chunks_loaded = await state.pipeline.ingest_file(path)
+            job.chunks_loaded = await state.pipeline.ingest_file(
+                path, source_uri=job.filename
+            )
         job.status = JobStatus.SUCCESS
     except Exception as exc:
         logger.exception("Задача %s провалилась", job.job_id)

@@ -1,9 +1,7 @@
 """Загрузчик: docling -> bge-m3 -> OpenSearch.
 
-Связывает три компонента:
-  1. docling-serve отдаёт чанки с провенансом (docling_chunker.py)
-  2. bge-m3 считает dense-вектор и разреженные лексические веса
-  3. OpenSearch принимает всё одним bulk с детерминированными _id
+bge-m3 НЕ использует инструкционные префиксы — ни "query: ", ни "passage: ".
+Забытый от e5 префикс не даст ошибки, он просто просадит выдачу.
 """
 
 from __future__ import annotations
@@ -22,27 +20,24 @@ from docling_client import (
     ChunkingOptions,
     ConversionOptions,
     DoclingChunk,
-    FileDoclingChunker,
+    DoclingFileClient,
 )
 
 logger = logging.getLogger(__name__)
 
-EMBED_DIM = 1024  # bge-m3 dense
+EMBED_DIM = 1024
+
+SEARCH_SOURCE_EXCLUDES = ["content_vector", "content_sparse"]
 
 
 @dataclass(frozen=True)
 class EmbeddingResult:
-    """Выход bge-m3: плотный вектор плюс разреженные веса."""
-
     dense: list[float]
     sparse: dict[str, float]
 
 
 class BaseEmbedder(ABC):
-    """Считает эмбеддинги пачками, разбивая вход на батчи.
-
-    Подклассы реализуют только сам вызов модели.
-    """
+    """Считает эмбеддинги пачками. Подклассы реализуют только вызов модели."""
 
     def __init__(self, batch_size: int = 16) -> None:
         self._batch_size = batch_size
@@ -65,10 +60,11 @@ class BaseEmbedder(ABC):
 
 
 class BgeM3Embedder(BaseEmbedder):
-    """bge-m3 в процессе загрузчика, через FlagEmbedding.
+    """bge-m3 через FlagEmbedding: dense и sparse из одного прохода.
 
-    Отдаёт dense и sparse из одного прохода — отдельная SPLADE-модель
-    для разреженной ветки не нужна.
+    FlagEmbedding, а не sentence-transformers: последний отдаёт только dense,
+    доступа к sparse-голове там нет. А lexical_weights — это готовая замена
+    SPLADE для третьей ветки гибрида.
     """
 
     def __init__(
@@ -85,8 +81,7 @@ class BgeM3Embedder(BaseEmbedder):
 
         self._max_length = max_length
         self._model = BGEM3FlagModel(
-            model_name, use_fp16=use_fp16, devices=device
-        )
+            model_name, use_fp16=use_fp16, devices=device)
 
     def _embed_batch(self, texts: list[str]) -> list[EmbeddingResult]:
         output = self._model.encode(
@@ -114,11 +109,10 @@ class BgeM3Embedder(BaseEmbedder):
 
 
 class HttpEmbedder(BaseEmbedder):
-    """Обращение к вынесенному сервису эмбеддингов.
+    """Обращение к вынесенному сервису эмбеддингов (ingest_api /embed).
 
-    Тот же интерфейс, но модель живёт в одном экземпляре на всю систему —
-    и загрузчик, и поиск ходят к ней, так что вектор запроса физически
-    не может разойтись с вектором документа.
+    Модель существует в одном экземпляре на всю систему, поэтому вектор
+    запроса физически не может разойтись с вектором документа.
     """
 
     def __init__(
@@ -178,7 +172,7 @@ INDEX_BODY: dict[str, Any] = {
             "source_uri": {"type": "keyword"},
             "chunk_index": {"type": "integer"},
             "content": {"type": "text", "analyzer": "ru_en"},
-            "headings": {"type": "text", "analyzer": "ru_en"},
+            "headings": {"type": "keyword"},
             "pages": {"type": "integer"},
             "content_hash": {"type": "keyword"},
             "content_vector": {
@@ -205,12 +199,12 @@ class OpenSearchLoader:
         self._index = index
 
     async def ensure_index(self, body: dict[str, Any] | None = None) -> None:
+        """В проде создание индекса — это миграция, а не побочный эффект
+        старта сервиса: смена маппинга требует reindex. Вызывать явно."""
         if await self._client.indices.exists(index=self._index):
             logger.info("Индекс %s уже существует", self._index)
             return
-        await self._client.indices.create(
-            index=self._index, body=body or INDEX_BODY
-        )
+        await self._client.indices.create(index=self._index, body=body or INDEX_BODY)
         logger.info("Создан индекс %s", self._index)
 
     async def load(
@@ -247,8 +241,9 @@ class OpenSearchLoader:
         return succeeded
 
     async def existing_hashes(self, source_uri: str) -> dict[str, str]:
-        """Хэши уже загруженных чанков документа — чтобы не переиндексировать
-        то, что не изменилось."""
+        """Хэши уже загруженных чанков документа."""
+        if not await self._client.indices.exists(index=self._index):
+            return {}
         response = await self._client.search(
             index=self._index,
             body={
@@ -268,7 +263,7 @@ class IngestPipeline:
 
     def __init__(
         self,
-        chunker: FileDoclingChunker,
+        chunker: DoclingFileClient,
         embedder: BaseEmbedder,
         loader: OpenSearchLoader,
         *,
@@ -281,33 +276,49 @@ class IngestPipeline:
         self._conversion = conversion or ConversionOptions()
         self._chunking = chunking or ChunkingOptions()
 
-    async def ingest_file(self, path: Path, *, skip_unchanged: bool = True) -> int:
+    async def ingest_file(
+        self,
+        path: Path,
+        *,
+        source_uri: str | None = None,
+        skip_unchanged: bool = True,
+    ) -> int:
+        """source_uri — устойчивый идентификатор документа.
+
+        Обязателен, когда path указывает на временный файл: _id чанка
+        строится от source_uri, и при загрузке через HTTP путь вида
+        /tmp/ingest-XXXX/... меняется на каждый запрос. Тогда повторная
+        загрузка того же документа не перезапишет старые чанки, а создаст
+        новые с другими _id — дубли накопятся молча.
+        """
+        uri = source_uri or path.as_posix()
+
         chunks = await self._chunker.chunk(
-            path, conversion=self._conversion, chunking=self._chunking
+            path,
+            conversion=self._conversion,
+            chunking=self._chunking,
+            source_uri=uri,
         )
         if not chunks:
-            logger.warning("%s: чанков не получено", path)
+            logger.warning("%s: чанков не получено", uri)
             return 0
 
         if skip_unchanged:
-            known = await self._loader.existing_hashes(path.as_posix())
-            chunks = [
-                c for c in chunks if known.get(c.chunk_id) != c.content_hash
-            ]
+            known = await self._loader.existing_hashes(uri)
+            chunks = [c for c in chunks if known.get(
+                c.chunk_id) != c.content_hash]
             if not chunks:
-                logger.info("%s: изменений нет, пропуск", path)
+                logger.info("%s: изменений нет, пропуск", uri)
                 return 0
 
         embeddings = await asyncio.to_thread(
-            self._embedder.embed, [c.text for c in chunks]
+            self._embedder.embed, [c.embed_text for c in chunks]
         )
         loaded = await self._loader.load(chunks, embeddings)
-        logger.info("%s: загружено %d чанков", path, loaded)
+        logger.info("%s: загружено %d чанков", uri, loaded)
         return loaded
 
-    async def ingest_all(
-        self, paths: Iterable[Path], *, concurrency: int = 3
-    ) -> int:
+    async def ingest_all(self, paths: Iterable[Path], *, concurrency: int = 3) -> int:
         semaphore = asyncio.Semaphore(concurrency)
 
         async def _guarded(path: Path) -> int:
@@ -330,17 +341,17 @@ async def main() -> None:
     loader = OpenSearchLoader(os_client, index="kb-v1")
     await loader.ensure_index()
 
-    async with FileDoclingChunker("http://localhost:5001") as chunker:
+    async with DoclingFileClient("http://localhost:5001") as chunker:
         pipeline = IngestPipeline(
             chunker,
             embedder,
             loader,
-            conversion=ConversionOptions(do_ocr=True, ocr_lang=("eslav",)),
+            conversion=ConversionOptions(
+                do_ocr=True, force_ocr=True, ocr_lang=("eslav",)
+            ),
             chunking=ChunkingOptions(tokenizer="BAAI/bge-m3", max_tokens=768),
         )
-        total = await pipeline.ingest_all(
-            sorted(Path("./corpus").glob("**/*.pdf"))
-        )
+        total = await pipeline.ingest_all(sorted(Path("./corpus").glob("**/*.pdf")))
 
     logger.info("Всего загружено чанков: %d", total)
     await os_client.close()

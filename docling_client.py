@@ -1,7 +1,8 @@
-"""Клиент docling-serve: конверсия + hybrid chunking через HTTP API.
+"""HTTP-клиент docling-serve.
 
-Стадия Parse+Structure+Chunk выносится в отдельный сервис; на выходе —
-готовые к эмбеддингу чанки с провенансом (страницы, заголовки).
+Чанкинг выполняет ВСТРОЕННЫЙ HybridChunker на стороне сервиса: мы лишь
+передаём ему токенизатор и лимит токенов. Здесь только транспорт —
+отправить файл, дождаться задачи, разобрать JSON.
 """
 
 from __future__ import annotations
@@ -27,34 +28,36 @@ class DoclingTimeoutError(DoclingError):
     """Задача не завершилась за отведённое время."""
 
 
-
 @dataclass(frozen=True)
 class ConversionOptions:
-    """Параметры конверсии документа (OCR, таблицы, бэкенд PDF).
-
-    Точный список полей стоит сверять с /docs живого сервера — схема
-    меняется между минорными версиями docling-serve.
-    """
+    """Параметры конверсии. Точные имена полей сверяй с /docs живого сервера."""
 
     do_ocr: bool = True
     force_ocr: bool = False
-    ocr_lang: Sequence[str] = ("eslav",)
+
+    ocr_engine: str | None = "easyocr"
+    ocr_lang: Sequence[str] = ("ru", "en")
+
     ocr_preset: str | None = None
     table_mode: str = "accurate"
     pdf_backend: str | None = None
 
-    def as_form_fields(self) -> list[tuple[str, str]]:
-        fields: list[tuple[str, str]] = [
-            ("do_ocr", str(self.do_ocr).lower()),
-            ("force_ocr", str(self.force_ocr).lower()),
-            ("table_mode", self.table_mode),
-        ]
-        fields += [("ocr_lang", lang) for lang in self.ocr_lang]
+    def as_form_data(self) -> dict[str, Any]:
+        """httpx проверяет data на Mapping. Список кортежей он принимает
+        за сырое тело запроса и молча игнорирует files."""
+        data: dict[str, Any] = {
+            "do_ocr": str(self.do_ocr).lower(),
+            "force_ocr": str(self.force_ocr).lower(),
+            "table_mode": self.table_mode,
+            "ocr_lang": list(self.ocr_lang),
+        }
+        if self.ocr_engine:
+            data["ocr_engine"] = self.ocr_engine
         if self.ocr_preset:
-            fields.append(("ocr_preset", self.ocr_preset))
+            data["ocr_preset"] = self.ocr_preset
         if self.pdf_backend:
-            fields.append(("pdf_backend", self.pdf_backend))
-        return fields
+            data["pdf_backend"] = self.pdf_backend
+        return data
 
     def as_json_options(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -63,50 +66,27 @@ class ConversionOptions:
             "ocr_lang": list(self.ocr_lang),
             "table_mode": self.table_mode,
         }
+        if self.ocr_engine:
+            out["ocr_engine"] = self.ocr_engine
         if self.ocr_preset:
             out["ocr_preset"] = self.ocr_preset
         if self.pdf_backend:
             out["pdf_backend"] = self.pdf_backend
         return out
 
-    def as_form_data(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
-            "do_ocr": str(self.do_ocr).lower(),
-            "force_ocr": str(self.force_ocr).lower(),
-            "table_mode": self.table_mode,
-            "ocr_lang": list(self.ocr_lang),  # список -> повторяющиеся поля
-        }
-        if self.ocr_preset:
-            data["ocr_preset"] = self.ocr_preset
-        if self.pdf_backend:
-            data["pdf_backend"] = self.pdf_backend
-        return data
-
 
 @dataclass(frozen=True)
 class ChunkingOptions:
-    """Параметры HybridChunker. Уходят на сервер с префиксом ``chunking_``."""
+    """Параметры встроенного HybridChunker. Уходят с префиксом chunking_."""
 
     tokenizer: str = "BAAI/bge-m3"
+
     max_tokens: int = 768
+
     merge_peers: bool = True
 
     _PREFIX = "chunking_"
 
-    def as_form_fields(self) -> list[tuple[str, str]]:
-        return [
-            (f"{self._PREFIX}tokenizer", self.tokenizer),
-            (f"{self._PREFIX}max_tokens", str(self.max_tokens)),
-            (f"{self._PREFIX}merge_peers", str(self.merge_peers).lower()),
-        ]
-
-    def as_json_options(self) -> dict[str, Any]:
-        return {
-            f"{self._PREFIX}tokenizer": self.tokenizer,
-            f"{self._PREFIX}max_tokens": self.max_tokens,
-            f"{self._PREFIX}merge_peers": self.merge_peers,
-        }
-    
     def as_form_data(self) -> dict[str, Any]:
         return {
             f"{self._PREFIX}tokenizer": self.tokenizer,
@@ -114,14 +94,32 @@ class ChunkingOptions:
             f"{self._PREFIX}merge_peers": str(self.merge_peers).lower(),
         }
 
+    def as_json_options(self) -> dict[str, Any]:
+        return {
+            f"{self._PREFIX}tokenizer": self.tokenizer,
+            f"{self._PREFIX}max_tokens": self.max_tokens,
+            f"{self._PREFIX}merge_peers": self.merge_peers,
+        }
+
 
 @dataclass(frozen=True)
 class DoclingChunk:
-    """Чанк, готовый к эмбеддингу и индексации."""
+    """Два представления текста, и это принципиально.
+
+    text       — сырой. Идёт в индекс под BM25 и в выдачу пользователю.
+    embed_text — контекстуализированный, с приклеенными родительскими
+                 заголовками. Идёт ТОЛЬКО в модель.
+
+    Если индексировать контекстуализированный вариант, термины заголовков
+    попадут в индекс дважды (в content и в headings), и BM25 завысит им
+    term frequency: документы из разделов с удачными названиями начнут
+    всплывать безосновательно.
+    """
 
     source_uri: str
     index: int
     text: str
+    embed_text: str
     headings: tuple[str, ...] = ()
     pages: tuple[int, ...] = ()
     doc_meta: dict[str, Any] = field(default_factory=dict)
@@ -134,7 +132,6 @@ class DoclingChunk:
 
     @property
     def content_hash(self) -> str:
-        """Хэш содержимого — чтобы пропускать неизменившиеся чанки."""
         return hashlib.blake2b(self.text.encode("utf-8"), digest_size=16).hexdigest()
 
     def to_source(self) -> dict[str, Any]:
@@ -149,8 +146,9 @@ class DoclingChunk:
         }
 
 
-class BaseDoclingChunker(ABC):
-    """Общий транспорт: submit -> poll -> result, обработка ошибок, разбор чанков.
+
+class BaseDoclingClient(ABC):
+    """Общий транспорт: submit -> poll -> result, ошибки, разбор чанков.
 
     Подклассы описывают только то, как собрать запрос на сабмит.
     """
@@ -174,8 +172,7 @@ class BaseDoclingChunker(ABC):
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=request_timeout)
 
-
-    async def __aenter__(self) -> "BaseDoclingChunker":
+    async def __aenter__(self) -> "BaseDoclingClient":
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
@@ -189,6 +186,13 @@ class BaseDoclingChunker(ABC):
     def _headers(self) -> dict[str, str]:
         return {"X-Api-Key": self._api_key} if self._api_key else {}
 
+    async def health(self) -> bool:
+        try:
+            response = await self._client.get(f"{self._base_url}/health")
+            return response.status_code == 200
+        except httpx.HTTPError:
+            return False
+
     async def chunk(
         self,
         source: Any,
@@ -197,7 +201,6 @@ class BaseDoclingChunker(ABC):
         chunking: ChunkingOptions | None = None,
         source_uri: str | None = None,
     ) -> list[DoclingChunk]:
-        """Прогнать документ через сервис и вернуть список чанков."""
         conversion = conversion or ConversionOptions()
         chunking = chunking or ChunkingOptions()
         uri = source_uri or self._default_uri(source)
@@ -224,7 +227,6 @@ class BaseDoclingChunker(ABC):
         concurrency: int = 4,
         **kwargs: Any,
     ) -> AsyncIterator[list[DoclingChunk]]:
-        """Обработать пачку источников с ограничением параллелизма."""
         semaphore = asyncio.Semaphore(concurrency)
 
         async def _guarded(src: Any) -> list[DoclingChunk]:
@@ -234,7 +236,6 @@ class BaseDoclingChunker(ABC):
         tasks = [asyncio.create_task(_guarded(src)) for src in sources]
         for task in asyncio.as_completed(tasks):
             yield await task
-
 
     @abstractmethod
     async def _submit(
@@ -284,49 +285,79 @@ class BaseDoclingChunker(ABC):
 
         chunks: list[DoclingChunk] = []
         for i, raw in enumerate(raw_chunks):
-            text = self._extract_text(raw)
-            if not text.strip():
+            raw_text, embed_text = self._extract_texts(raw)
+            if not raw_text.strip():
                 continue
             meta = raw.get("meta") or raw.get("metadata") or {}
             chunks.append(
                 DoclingChunk(
                     source_uri=uri,
                     index=i,
-                    text=text,
-                    headings=tuple(meta.get("headings") or ()),
-                    pages=self._extract_pages(meta),
+                    text=raw_text,
+                    embed_text=embed_text,
+                    headings=tuple(
+                        raw.get("headings") or meta.get("headings") or ()
+                    ),
+                    pages=self._extract_pages(raw, meta),
                 )
             )
         return chunks
 
     @staticmethod
-    def _extract_text(raw: dict[str, Any]) -> str:
-        """Нужен контекстуализированный текст (с родительскими заголовками).
+    def _extract_texts(raw: dict[str, Any]) -> tuple[str, str]:
+        """Вернуть (сырой, контекстуализированный).
 
-        Имя поля различается между версиями — сверься с /docs, если чанки
-        приходят без заголовков в начале.
+        Имена полей различаются между версиями docling-serve. Прогони один
+        документ и проверь: если content в индексе начинается с заголовков,
+        значит сырой вариант лежит под другим ключом — поправь списки ниже.
+        Актуальная схема всегда на /docs живого сервера.
         """
-        for key in ("contextualized_text", "text", "raw_text"):
-            value = raw.get(key)
-            if isinstance(value, str) and value:
-                return value
-        return ""
+        def pick(*keys: str) -> str:
+            for key in keys:
+                value = raw.get(key)
+                if isinstance(value, str) and value:
+                    return value
+            return ""
+
+        contextual = pick("contextualized_text", "text")
+        plain = pick("raw_text", "text")
+        return plain or contextual, contextual or plain
 
     @staticmethod
-    def _extract_pages(meta: dict[str, Any]) -> tuple[int, ...]:
+    def _extract_pages(raw: dict[str, Any], meta: dict[str, Any]) -> tuple[int, ...]:
+        """Номера страниц лежат в двух разных местах в зависимости от версии.
+
+        В v1.21.0 это page_numbers прямо на чанке, а doc_items приходит
+        плоским списком ссылок вида "#/texts/4" — без вложенного prov.
+        Более старые версии отдавали провенанс внутри meta.doc_items[].prov.
+        Проверяем оба.
+        """
         pages: set[int] = set()
+
+        for page in raw.get("page_numbers") or ():
+            if isinstance(page, int):
+                pages.add(page)
+
         for item in meta.get("doc_items") or ():
+            if not isinstance(item, dict):
+                continue
             for prov in item.get("prov") or ():
                 page = prov.get("page_no")
                 if isinstance(page, int):
                     pages.add(page)
+
         return tuple(sorted(pages))
 
 
-class FileDoclingChunker(BaseDoclingChunker):
+class DoclingFileClient(BaseDoclingClient):
     """Загрузка локального файла через multipart."""
 
-    async def _submit(self, source, conversion, chunking) -> str:
+    async def _submit(
+        self,
+        source: Path | str,
+        conversion: ConversionOptions,
+        chunking: ChunkingOptions,
+    ) -> str:
         path = Path(source)
         data = {**conversion.as_form_data(), **chunking.as_form_data()}
 
@@ -345,8 +376,12 @@ class FileDoclingChunker(BaseDoclingChunker):
         return Path(source).as_posix()
 
 
-class UrlDoclingChunker(BaseDoclingChunker):
-    """Обработка документа по HTTP-ссылке — сервис скачивает его сам."""
+class DoclingUrlClient(BaseDoclingClient):
+    """Документ по HTTP-ссылке — сервис скачивает его сам.
+
+    Для S3/MinIO выгоднее этого варианта нет: presigned URL, и байты не
+    проходят через твой процесс дважды.
+    """
 
     async def _submit(
         self,
@@ -371,38 +406,3 @@ class UrlDoclingChunker(BaseDoclingChunker):
 
     def _default_uri(self, source: str) -> str:
         return source
-
-
-def to_bulk_actions(
-    chunks: Iterable[DoclingChunk],
-    index: str,
-    *,
-    embeddings: Sequence[Sequence[float]] | None = None,
-    vector_field: str = "content_vector",
-) -> list[dict[str, Any]]:
-    """Собрать действия для opensearchpy.helpers.bulk / async_bulk.
-
-    Если embeddings не переданы, вектор считает ingest-pipeline на стороне
-    OpenSearch (ML Commons). Иначе — кладём посчитанные клиентом.
-    """
-    chunks = list(chunks)
-    if embeddings is not None and len(embeddings) != len(chunks):
-        raise ValueError(
-            f"Число векторов ({len(embeddings)}) не совпадает с числом "
-            f"чанков ({len(chunks)})"
-        )
-
-    actions: list[dict[str, Any]] = []
-    for position, chunk in enumerate(chunks):
-        source = chunk.to_source()
-        if embeddings is not None:
-            source[vector_field] = list(embeddings[position])
-        actions.append(
-            {
-                "_op_type": "index",  # index, не create: перезапись идемпотентна
-                "_index": index,
-                "_id": chunk.chunk_id,
-                "_source": source,
-            }
-        )
-    return actions
