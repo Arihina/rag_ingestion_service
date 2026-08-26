@@ -1,9 +1,14 @@
-# Запуск: docker compose -f docker-compose.dev.yml up -d --build
-# Все порты биндятся на 127.0.0.1 — наружу ничего не торчит.
+# Запуск: docker compose -f docker-compose.dev.yml up -d
 #
-# Веса моделей живут на volume docling-models, а не в образе.
-# Пересборка образа их не трогает: docker compose build --no-cache
-# перестаёт стоить полчаса и десятки гигабайт.
+# Кастомный образ не нужен: EasyOCR и RapidOCR входят в docling-serve.
+# Dockerfile можно удалить.
+#
+# Перед первым запуском ОДИН РАЗ на хосте:
+#   mkdir -p /home/dodo/storage/docling-models
+#   sudo chown -R 1001:0 /home/dodo/storage/docling-models
+#   sudo chmod -R g+rwX /home/dodo/storage/docling-models
+
+x-docling-image: &docling-image ghcr.io/docling-project/docling-serve-cu128:v1.21.0
 
 services:
   opensearch:
@@ -14,11 +19,10 @@ services:
       - plugins.security.disabled=true
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Opensearch1!
       - bootstrap.memory_lock=true
-      # 512m хватало на e5-small; с 1024-мерными векторами bge-m3
-      # и bulk-загрузкой пачками этого мало даже в деве.
+      # 512m хватало на e5-small; с 1024-мерными векторами bge-m3 мало.
       - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
-      # HNSW-графы живут вне heap — этот лимит отдельный,
-      # и считается он от памяти контейнера, отсюда mem_limit ниже.
+      # HNSW-графы живут ВНЕ heap: лимит отдельный, считается
+      # от памяти контейнера — отсюда mem_limit ниже.
       - knn.memory.circuit_breaker.limit=60%
     ulimits:
       memlock:
@@ -51,49 +55,66 @@ services:
       opensearch:
         condition: service_healthy
 
-  # Одноразовый: наполняет volume и завершается.
-  # Повторный up видит уже скачанное и проходит мгновенно.
+  # Одноразовый: наполняет /models и завершается.
+  #
+  # command — СПИСОК с блочным скаляром. Строковый вариант ("command: >")
+  # Compose разбивает по пробелам, и bash -c получает только первое слово.
+  #
+  # rapidocr ОБЯЗАТЕЛЕН, даже если работать будем на easyocr: docling-serve
+  # на старте прогревает пайплайн с ДЕФОЛТНЫМИ опциями, а дефолтный движок —
+  # auto, который выбирает RapidOCR. Без этих весов контейнер падает
+  # с FileNotFoundError ещё до первого запроса.
+  #
+  # Русскую модель EasyOCR тянем отдельно: docling отключает докачку весов
+  # в рантайме, когда задан artifacts_path (считает это офлайн-режимом),
+  # а docling-tools кладёт только детектор и латиницу.
   docling-models-init:
-    build:
-      context: .
-      args:
-        DOCLING_BASE: ghcr.io/docling-project/docling-serve-cu128:v1.21.0
+    image: *docling-image
     container_name: docling-models-init
     user: "0"
     environment:
       HF_HOME: /models/hf
-    entrypoint: ["/bin/bash", "-lc"]
-    command: >
-      set -e;
-      docling-tools models download -o /models/docling layout tableformer;
-      python -c "from transformers import AutoTokenizer;
-                 AutoTokenizer.from_pretrained('BAAI/bge-m3')";
-      chown -R 1001:0 /models
+      HOME: /models/home
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -eux
+        mkdir -p /models/docling /models/hf /models/home
+        docling-tools models download -o /models/docling \
+          layout tableformer easyocr rapidocr
+        python - <<'PY'
+        import easyocr
+        easyocr.Reader(
+            ["ru", "en"],
+            model_storage_directory="/models/docling/EasyOcr",
+            download_enabled=True,
+            gpu=False,
+        )
+        PY
+        python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('BAAI/bge-m3')"
+        chown -R 1001:0 /models
+        echo "=== ИТОГ ==="
+        du -sh /models/*
+        ls -la /models/docling/EasyOcr || true
     volumes:
-      - docling-models:/models
+      - /home/dodo/storage/docling-models:/models
     restart: "no"
 
   docling:
-    build:
-      context: .
-      args:
-        DOCLING_BASE: ghcr.io/docling-project/docling-serve-cu128:v1.21.0
+    image: *docling-image
     container_name: docling-serve-dev
     environment:
       DOCLING_SERVE_ARTIFACTS_PATH: /models/docling
       HF_HOME: /models/hf
+      HOME: /models/home
       DOCLING_DEVICE: cuda:0
       DOCLING_NUM_THREADS: "4"
-      # UI на /ui: можно закинуть проблемный PDF руками и посмотреть,
-      # что вернули layout и OCR, не гоняя пайплайн целиком.
       DOCLING_SERVE_ENABLE_UI: "true"
       DOCLING_SERVE_ENG_KIND: local
-      # HF_HUB_OFFLINE намеренно не выставлен: модели RapidOCR под eslav
-      # докачиваются в рантайме при первом OCR (см. README).
     ports:
       - "127.0.0.1:5001:5001"
     volumes:
-      - docling-models:/models
+      - /home/dodo/storage/docling-models:/models
     depends_on:
       docling-models-init:
         condition: service_completed_successfully
@@ -113,4 +134,3 @@ services:
 
 volumes:
   opensearch-data:
-  docling-models:
