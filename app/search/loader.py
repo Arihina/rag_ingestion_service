@@ -9,6 +9,7 @@ from typing import Any, Sequence
 from opensearchpy import AsyncOpenSearch
 from opensearchpy.helpers import async_bulk
 
+from app.config import settings
 from app.docling import DoclingChunk
 from app.embeddings import EmbeddingResult
 
@@ -65,6 +66,10 @@ class OpenSearchLoader:
         )
         if errors:
             logger.error("Bulk: %d ошибок, первая: %s", len(errors), errors[0])
+
+        if succeeded and settings.refresh_after_load:
+            await self._client.indices.refresh(index=self._index)
+
         return succeeded
 
     async def existing_hashes(self, rag_id: str, document_id: str) -> dict[str, str]:
