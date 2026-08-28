@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 
-"""Параметры конверсии и чанкинга. Точные имена полей сверяй с /docs
-живого docling-serve — они менялись между версиями."""
+"""Параметры конверсии и чанкинга."""
 
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -75,8 +74,13 @@ class ChunkingOptions:
         }
 
     def as_json_options(self) -> dict[str, Any]:
+        """Для JSON-тела префикса НЕТ: поля лежат внутри chunking_options.
+
+        Префикс chunking_ нужен только form-варианту на /file/async, где
+        всё плоское и разделять объекты нечем.
+        """
         return {
-            f"{self._PREFIX}tokenizer": self.tokenizer,
-            f"{self._PREFIX}max_tokens": self.max_tokens,
-            f"{self._PREFIX}merge_peers": self.merge_peers,
+            "tokenizer": self.tokenizer,
+            "max_tokens": self.max_tokens,
+            "merge_peers": self.merge_peers,
         }
