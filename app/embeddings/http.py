@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+
+"""Клиент к вынесенному /embed. Им пользуется agentic_rag: поисковому
+бэкенду не нужен ни torch, ни GPU, а вектор запроса не может разойтись
+с вектором документа."""
+
 from .base import BaseEmbedder, EmbeddingResult
 
 
@@ -17,11 +22,13 @@ class HttpEmbedder(BaseEmbedder):
         batch_size: int = 32,
         api_key: str | None = None,
         timeout: float = 120.0,
+        pool: str = "query",
     ) -> None:
         super().__init__(batch_size=batch_size)
         import httpx
 
         self._url = url.rstrip("/")
+        self._pool = pool
         self._client = httpx.Client(
             timeout=timeout,
             headers={"X-Api-Key": api_key} if api_key else {},
@@ -29,7 +36,7 @@ class HttpEmbedder(BaseEmbedder):
 
     def _embed_batch(self, texts: list[str]) -> list[EmbeddingResult]:
         response = self._client.post(
-            f"{self._url}/embed", json={"texts": texts})
+            f"{self._url}/embed", json={"texts": texts, "pool": self._pool})
         response.raise_for_status()
         return [
             EmbeddingResult(dense=item["dense"], sparse=item.get("sparse", {}))
