@@ -1,5 +1,12 @@
 # Запуск: docker compose -f docker-compose.prod.yml up -d
-# Требует .env с DOCLING_KEY, OPENSEARCH_PASSWORD, DOCLING_IMAGE.
+# Требует .env с DOCLING_KEY, OPENSEARCH_PASSWORD, DOCLING_IMAGE,
+# POSTGRES_PASSWORD, S3_ACCESS_KEY, S3_SECRET_KEY, INGEST_API_KEY,
+# INGEST_IMAGE_API, INGEST_IMAGE_WORKER.
+#
+# Образы api и worker собираются в CI из одного Dockerfile двумя целями:
+#   docker build --target api    -t <registry>/rag-ingest-api:<tag> .
+#   docker build --target worker -t <registry>/rag-ingest-worker:<tag> .
+# Пинить по digest, а не по тегу.
 #
 # Образ здесь не собирается — приезжает из реестра, собранный в CI.
 # По-хорошему пинить не по тегу, а по digest: тег можно молча перезаписать.
@@ -53,9 +60,15 @@ services:
       timeout: 10s
       retries: 10
 
+  # Один инстанс на две независимые очереди: docling сидит на базе 0
+  # (DOCLING_SERVE_ENG_RQ_REDIS_URL), control plane — на базе 1
+  # (INGEST_REDIS_URL). Общий Redis, раздельные пространства ключей.
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # appendonly: очередь переживает рестарт. Без него задачи, поставленные
+    # за последнюю минуту, теряются молча, а документы навсегда остаются
+    # в pending.
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
@@ -64,6 +77,65 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      POSTGRES_DB: rag_ingest
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag_ingest"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Одна нода: master, volume, filer и S3-шлюз одним процессом.
+  # Разносить роли имеет смысл, когда упрёмся в объём или IO.
+  #
+  # Наружу не публикуется вовсе: доступ только из сети compose. Пользователь
+  # ходит в хранилище через API сервиса, а не напрямую — прямой доступ
+  # понадобится, когда появится пользовательский импорт со скоупленными
+  # доступами, и его надо будет открывать осознанно.
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.98
+    restart: unless-stopped
+    command:
+      - server
+      - -dir=/data
+      - -master.volumeSizeLimitMB=30000
+      # Явное число, а не 0: ноль означает 'посчитать по свободному
+      # месту', и результат зависит от того, что вернёт ФС тома.
+      - -volume.max=500
+      - -filer
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/seaweedfs-s3.prod.json
+    volumes:
+      - seaweedfs-data:/data
+      # Монтируется КАТАЛОГ, а не файл. При bind-mount одиночного файла
+      # Docker молча создаёт на его месте пустой каталог, если файла нет,
+      # и weed падает с 'is a directory' — причём уже после того, как
+      # master, volume и filer успешно поднялись, так что в общем логе
+      # это выглядит как сбой всего сервиса.
+      - ./deploy:/etc/seaweedfs:ro
+    expose:
+      - "8333"
+    healthcheck:
+      # 127.0.0.1, а НЕ localhost: /etc/hosts в alpine резолвит localhost
+      # в ::1, а weed слушает только IPv4 — проверка не достучится до
+      # работающего сервиса, контейнер повиснет unhealthy, и за ним не
+      # поднимется всё, что ждёт service_healthy.
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:9333/cluster/status || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   docling-api:
     <<: *docling-common
@@ -94,6 +166,74 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # Владеет GPU и обеими копиями bge-m3. Единственный процесс, который
+  # сериализует доступ к карте, — отсюда ровно одна реплика.
+  api:
+    image: ${INGEST_IMAGE_API:?set INGEST_IMAGE_API}
+    restart: unless-stopped
+    environment:
+      INGEST_HOST: 0.0.0.0
+      INGEST_API_KEY: ${INGEST_API_KEY:?required}
+      INGEST_DOCLING_URL: http://docling-api:5001
+      INGEST_DOCLING_API_KEY: ${DOCLING_KEY}
+      INGEST_OPENSEARCH_URL: https://opensearch:9200
+      INGEST_OPENSEARCH_USER: admin
+      INGEST_OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD}
+      INGEST_DATABASE_URL: postgresql+asyncpg://rag:${POSTGRES_PASSWORD}@postgres:5432/rag_ingest
+      INGEST_REDIS_URL: redis://redis:6379/1
+      INGEST_S3_ENDPOINT_URL: http://seaweedfs:8333
+      INGEST_S3_ACCESS_KEY: ${S3_ACCESS_KEY:?required}
+      INGEST_S3_SECRET_KEY: ${S3_SECRET_KEY:?required}
+      HF_HOME: /models/hf
+      # Том с весами здесь гарантированно полон, так что запрещаем
+      # рантайму лазить в сеть.
+      HF_HUB_OFFLINE: "1"
+    volumes:
+      - models:/models:ro
+    expose:
+      - "8000"
+    depends_on:
+      opensearch: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      seaweedfs: { condition: service_healthy }
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Реплицируется свободно: модели нет, GPU не нужен, состояние — в Postgres.
+  # Это и есть та ручка, которой масштабируется индексация, а не workers у api.
+  worker:
+    image: ${INGEST_IMAGE_WORKER:?set INGEST_IMAGE_WORKER}
+    restart: unless-stopped
+    environment:
+      INGEST_API_KEY: ${INGEST_API_KEY}
+      INGEST_DOCLING_URL: http://docling-api:5001
+      INGEST_DOCLING_API_KEY: ${DOCLING_KEY}
+      INGEST_OPENSEARCH_URL: https://opensearch:9200
+      INGEST_OPENSEARCH_USER: admin
+      INGEST_OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD}
+      INGEST_DATABASE_URL: postgresql+asyncpg://rag:${POSTGRES_PASSWORD}@postgres:5432/rag_ingest
+      INGEST_REDIS_URL: redis://redis:6379/1
+      INGEST_RQ_QUEUE_INGEST: ingest
+      INGEST_RQ_QUEUE_MAINTENANCE: maintenance
+      INGEST_S3_ENDPOINT_URL: http://seaweedfs:8333
+      INGEST_S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      INGEST_S3_SECRET_KEY: ${S3_SECRET_KEY}
+      INGEST_SELF_URL: http://api:8000
+    depends_on:
+      api: { condition: service_started }
+      redis: { condition: service_healthy }
+    deploy:
+      replicas: 2
+
 volumes:
+  models:
   opensearch-data:
   redis-data:
+  postgres-data:
+  seaweedfs-data:

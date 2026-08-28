@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.venv
+venv
+ingest.env
+deploy/seaweedfs-s3.prod.json
+docker-compose*.yml
+README.md
+corpus/
