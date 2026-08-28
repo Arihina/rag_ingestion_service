@@ -11,6 +11,13 @@ class Settings(BaseSettings):
         env_prefix="INGEST_", env_file="ingest.env", extra="ignore"
     )
 
+    # сеть сервиса
+    host: str = "127.0.0.1"
+    port: int = 8000
+    reload: bool = False
+    log_level: str = "info"
+    timeout_keep_alive: int = 300
+
     docling_url: str = "http://localhost:5001"
     docling_api_key: str | None = None
 
@@ -18,6 +25,8 @@ class Settings(BaseSettings):
     opensearch_user: str | None = None
     opensearch_password: str | None = None
     index_name: str = "kb-v2"
+    opensearch_timeout: float = 60.0
+    refresh_after_load: bool = True
 
     embed_model: str = "BAAI/bge-m3"
     embed_batch_size: int = 16
@@ -32,6 +41,56 @@ class Settings(BaseSettings):
     api_key: str | None = None
     max_upload_mb: int = 200
 
+    # control plane
+    database_url: str = "postgresql+asyncpg://rag:rag@localhost:5432/rag_ingest"
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+
+    redis_url: str = "redis://localhost:6379/1"
+    rq_queue_ingest: str = "ingest"
+    rq_queue_maintenance: str = "maintenance"
+    rq_job_timeout: int = 3600
+
+    # Адрес самого сервиса: по нему воркер ходит за векторами в /embed.
+    # Воркер не держит модель — см. app/tasks/jobs.py.
+    self_url: str = "http://localhost:8000"
+
+    # --- SeaweedFS (S3-шлюз) ---
+    s3_endpoint_url: str = "http://localhost:8333"
+    # Адрес, который попадает В САМУ presigned-ссылку.
+    s3_presign_endpoint_url: str | None = None
+
+    # Как файл попадает в docling:
+    docling_transfer: str = "url"
+    s3_access_key: str = "rag"
+    s3_secret_key: str = "rag"
+    s3_region: str = "us-east-1"
+    s3_bucket_docs: str = "rag-docs"
+    s3_bucket_icons: str = "rag-icons"
+    s3_bucket_staging: str = "rag-staging"
+    presign_ttl_seconds: int = 3600
+
+    # лимиты архива: СЕРВЕРНЫЕ
+    archive_max_entries: int = 2000
+    archive_max_uncompressed: int = 5 * 1024**3
+    archive_max_ratio: float = 120.0
+    archive_max_file_size: int = 200 * 1024**2
+
+    # иконки
+    icon_max_bytes: int = 512 * 1024
+    icon_size_px: int = 256
+    icon_allowed_types: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp")
+
+    # дефолты и потолки конфига набора
+    rag_default_temperature: float = 0.3
+    rag_default_top_k: int = 5
+    rag_default_score_threshold: float = 0.0
+    rag_top_k_max: int = 10
+    rag_prompt_max_chars: int = 4000
+    rag_max_sets_per_owner: int = 50
+    rag_max_bytes_per_set: int = 20 * 1024**3
+
+    # Два независимых семафора и два экземпляра модели: ингест и запросы
     embed_concurrency: int = 1
     embed_query_concurrency: int = 2
     embed_query_batch_size: int = 8
