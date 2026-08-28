@@ -1,0 +1,12 @@
+# Только для роли API (и локального scripts/ingest_corpus.py).
+# Воркеры RQ этот файл не ставят: модель они не держат.
+#
+# ВАЖНО про torch. FlagEmbedding подтянет его с дефолтного индекса PyPI,
+# а для RTX 5070 Ti (Blackwell, sm_120) нужна сборка с CUDA >= 12.8.
+# Ставь torch ПЕРВЫМ и явно, иначе получишь то же
+# "no kernel image is available for execution on the device", что и в docling:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# BGEM3FlagModel: dense + lexical_weights из одного прохода.
+FlagEmbedding

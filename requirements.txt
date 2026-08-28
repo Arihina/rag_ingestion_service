@@ -1,29 +1,37 @@
-# Загрузчик и HTTP-слой. docling здесь нет: он живёт в своём контейнере,
-# общение с ним идёт по HTTP, а веса и torch лежат в его образе.
+# Загрузчик, HTTP-слой и control plane. docling здесь нет: он живёт в своём
+# контейнере, общение с ним идёт по HTTP, а веса и torch лежат в его образе.
 #
-# ВАЖНО про torch. FlagEmbedding подтянет torch с дефолтного индекса PyPI,
-# а для RTX 5070 Ti (Blackwell, sm_120) нужна сборка с CUDA >= 12.8.
-# Поставь torch ПЕРВЫМ и явно, иначе получишь тот же
-# "no kernel image is available for execution on the device", что и в docling:
+# Здесь ТОЛЬКО то, что нужно всем ролям. torch и FlagEmbedding вынесены
+# в requirements-embed.txt: их держит процесс API, а воркеры RQ модель
+# не загружают — за векторами они ходят в /embed.
 #
+# Для локального запуска нужны оба файла:
 #   pip install torch --index-url https://download.pytorch.org/whl/cu128
-#   pip install -r requirements.txt
+#   pip install -r requirements.txt -r requirements-embed.txt
 
-# --- HTTP-клиент к docling-serve ---
+# --- HTTP-клиенты ---
 httpx
 
-# --- эмбеддинги ---
-# BGEM3FlagModel: dense + lexical_weights из одного прохода
-FlagEmbedding
-
 # --- OpenSearch ---
-# async-клиент и helpers.async_bulk
 opensearch-py[async]
 
-# --- HTTP-слой загрузки ---
+# --- HTTP-слой ---
 fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
-# нужен FastAPI для multipart-загрузки файлов (UploadFile)
 python-multipart
+
+# --- control plane ---
+sqlalchemy[asyncio]>=2.0
+asyncpg
+psycopg[binary]     # синхронный драйвер для alembic
+alembic
+redis
+rq
+
+# --- объектное хранилище (SeaweedFS через S3-шлюз) ---
+boto3
+
+# --- переупаковка иконок: отбрасывает всё, что не пиксели ---
+pillow
