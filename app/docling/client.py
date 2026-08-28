@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
@@ -133,29 +134,38 @@ class BaseDoclingClient(ABC):
     @abstractmethod
     def _default_uri(self, source: Any) -> str:
         """Человекочитаемое имя источника — только для логов и текстов ошибок.
-
         В идентичность чанка больше не входит: её задают rag_id/document_id.
         """
 
     async def _wait(self, task_id: str) -> None:
+        """Опрос до успеха, отказа или таймаута.
+        Дедлайн по monotonic.
+        """
         url = f"{self._base_url}/v1/status/poll/{task_id}"
-        waited = 0.0
-        while waited < self._max_wait:
+        deadline = time.monotonic() + self._max_wait
+
+        while True:
             response = await self._client.get(url, headers=self._headers)
             response.raise_for_status()
-            status = response.json().get("task_status")
+            payload = response.json()
+            status = payload.get("task_status")
 
             if status == "success":
                 return
             if status == "failure":
-                raise DoclingError(f"Задача {task_id} завершилась с ошибкой")
+                detail = (
+                    payload.get("task_meta")
+                    or payload.get("error")
+                    or payload.get("task_error")
+                    or payload
+                )
+                raise DoclingError(f"Задача {task_id} провалилась: {detail}")
 
+            if time.monotonic() >= deadline:
+                raise DoclingTimeoutError(
+                    f"Задача {task_id} не завершилась за {self._max_wait} с"
+                )
             await asyncio.sleep(self._poll_interval)
-            waited += self._poll_interval
-
-        raise DoclingTimeoutError(
-            f"Задача {task_id} не завершилась за {self._max_wait} с"
-        )
 
     async def _fetch_result(self, task_id: str) -> dict[str, Any]:
         response = await self._client.get(
@@ -199,6 +209,7 @@ class BaseDoclingClient(ABC):
 
     @staticmethod
     def _extract_texts(raw: dict[str, Any]) -> tuple[str, str]:
+        """Вернуть (сырой, контекстуализированный)"""
         def pick(*keys: str) -> str:
             for key in keys:
                 value = raw.get(key)
@@ -212,6 +223,13 @@ class BaseDoclingClient(ABC):
 
     @staticmethod
     def _extract_pages(raw: dict[str, Any], meta: dict[str, Any]) -> tuple[int, ...]:
+        """Номера страниц лежат в двух разных местах в зависимости от версии.
+
+        В v1.21.0 это page_numbers прямо на чанке, а doc_items приходит
+        плоским списком ссылок вида "#/texts/4" — без вложенного prov.
+        Более старые версии отдавали провенанс внутри meta.doc_items[].prov.
+        Проверяем оба.
+        """
         pages: set[int] = set()
 
         for page in raw.get("page_numbers") or ():
@@ -257,8 +275,6 @@ class DoclingFileClient(BaseDoclingClient):
 
 
 class DoclingUrlClient(BaseDoclingClient):
-    """Документ по HTTP-ссылке — сервис скачивает его сам."""
-
     async def _submit(
         self,
         source: str,
@@ -266,11 +282,9 @@ class DoclingUrlClient(BaseDoclingClient):
         chunking: ChunkingOptions,
     ) -> str:
         body = {
-            "http_sources": [{"url": source}],
-            "options": {
-                **conversion.as_json_options(),
-                **chunking.as_json_options(),
-            },
+            "sources": [{"kind": "http", "url": source}],
+            "convert_options": conversion.as_json_options(),
+            "chunking_options": chunking.as_json_options(),
         }
         response = await self._client.post(
             f"{self._base_url}{self.CHUNK_PATH}/source/async",
