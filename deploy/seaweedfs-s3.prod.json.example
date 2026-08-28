@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Скопируй в seaweedfs-s3.prod.json и подставь реальные ключи.",
+    "Файл с ключами в git не коммитится — см. .gitignore.",
+    "accessKey/secretKey должны совпадать с INGEST_S3_ACCESS_KEY и",
+    "INGEST_S3_SECRET_KEY в окружении сервиса и воркеров.",
+    "",
+    "Admin оставлен ради create_bucket на первом старте (ensure_buckets).",
+    "После того как бакеты созданы, его можно снять и оставить",
+    "Read/Write/List/Tagging."
+  ],
+  "identities": [
+    {
+      "name": "rag",
+      "credentials": [
+        {
+          "accessKey": "ЗАМЕНИ",
+          "secretKey": "ЗАМЕНИ"
+        }
+      ],
+      "actions": ["Read", "Write", "List", "Tagging", "Admin"]
+    }
+  ]
+}
