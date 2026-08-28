@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Iterable
 
-from app.docling import ChunkingOptions, ConversionOptions, DoclingFileClient
+from app.docling import BaseDoclingClient, ChunkingOptions, ConversionOptions
 from app.embeddings import BaseEmbedder
 from app.search import OpenSearchLoader
 
@@ -20,7 +20,7 @@ class IngestPipeline:
 
     def __init__(
         self,
-        chunker: DoclingFileClient,
+        chunker: BaseDoclingClient,
         embedder: BaseEmbedder,
         loader: OpenSearchLoader,
         *,
@@ -43,13 +43,25 @@ class IngestPipeline:
         document_id: str,
         skip_unchanged: bool = True,
     ) -> int:
-        """Идентичность документа приходит из control plane, не из файла.
+        """Идентичность документа приходит из control plane, не из файла."""
+        return await self.ingest_source(
+            path, rag_id=rag_id, document_id=document_id, skip_unchanged=skip_unchanged
+        )
 
-        path может указывать на временный файл со случайным именем — на _id
-        чанков это больше не влияет.
+    async def ingest_source(
+        self,
+        source: object,
+        *,
+        rag_id: str,
+        document_id: str,
+        skip_unchanged: bool = True,
+    ) -> int:
+        """DoclingFileClient принимает путь, DoclingUrlClient — presigned URL.
+        Воркер использует второй: docling качает файл из хранилища сам, и
+        байты не проходят через наш процесс второй раз.
         """
         chunks = await self._chunker.chunk(
-            path,
+            source,
             rag_id=rag_id,
             document_id=document_id,
             conversion=self._conversion,

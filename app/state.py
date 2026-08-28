@@ -1,27 +1,25 @@
 from __future__ import annotations
 
+"""Разделяемое состояние процесса, собирается в lifespan.
 
-"""Разделяемое состояние процесса, собирается в lifespan."""
+Модель живёт ЗДЕСЬ, а не в воркерах.
+"""
 
 import asyncio
 
 from opensearchpy import AsyncOpenSearch
 
-from app.docling import DoclingFileClient
 from app.embeddings import BgeM3Embedder
-from app.jobs import JobRegistry
-from app.pipeline import IngestPipeline
 from app.search import OpenSearchLoader
+from app.storage import ObjectStorage
 
 
 class AppState:
     embedder: BgeM3Embedder
     query_embedder: BgeM3Embedder
-    chunker: DoclingFileClient
     loader: OpenSearchLoader
-    pipeline: IngestPipeline
     os_client: AsyncOpenSearch
-    jobs: JobRegistry
+    storage: ObjectStorage
     embed_sem: asyncio.Semaphore
     query_sem: asyncio.Semaphore
 
