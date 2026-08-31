@@ -10,18 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import ImportBatch, RagSet, get_session
-from app.deps import require_api_key
 from app.schemas.rags import BatchOut
 from app.storage import ObjectStorage
 from app.tasks.conn import maintenance_queue
 from app.tasks.jobs import import_s3_prefix
 
-router = APIRouter(
-    prefix="/admin", tags=["admin"], dependencies=[Depends(require_api_key)])
+router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 class S3ImportRequest(BaseModel):
-    """Префикс в staging-бакете, в локальном хранилище."""
+    """Префикс в staging-бакете, не во внешнем хранилище."""
 
     prefix: str = Field(min_length=1, max_length=512)
 

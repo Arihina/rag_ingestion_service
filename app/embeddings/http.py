@@ -20,7 +20,6 @@ class HttpEmbedder(BaseEmbedder):
         url: str,
         *,
         batch_size: int = 32,
-        api_key: str | None = None,
         timeout: float = 120.0,
         pool: str = "query",
     ) -> None:
@@ -29,10 +28,7 @@ class HttpEmbedder(BaseEmbedder):
 
         self._url = url.rstrip("/")
         self._pool = pool
-        self._client = httpx.Client(
-            timeout=timeout,
-            headers={"X-Api-Key": api_key} if api_key else {},
-        )
+        self._client = httpx.Client(timeout=timeout)
 
     def _embed_batch(self, texts: list[str]) -> list[EmbeddingResult]:
         response = self._client.post(

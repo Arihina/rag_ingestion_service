@@ -12,19 +12,16 @@ from __future__ import annotations
 import asyncio
 from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from app.config import settings
-from app.deps import require_api_key
 from app.state import state
 
 router = APIRouter(tags=["embed"])
 
 
 class EmbedRequest(BaseModel):
-    """texts — список: все варианты multi-query уходят ОДНИМ вызовом."""
-
     texts: list[str] = Field(min_length=1, max_length=256)
     pool: Literal["query", "ingest"] = "query"
 
@@ -39,7 +36,7 @@ class EmbedResponse(BaseModel):
     embeddings: list[EmbedItem]
 
 
-@router.post("/embed", response_model=EmbedResponse, dependencies=[Depends(require_api_key)])
+@router.post("/embed", response_model=EmbedResponse)
 async def embed(request: EmbedRequest) -> EmbedResponse:
     if request.pool == "ingest":
         embedder, semaphore = state.embedder, state.embed_sem

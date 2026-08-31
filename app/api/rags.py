@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import Document, ImportBatch, RagSet, get_session, repo
-from app.deps import current_user, require_api_key
+from app.deps import current_user
 from app.schemas.rags import (
     BatchOut,
     DocumentAccepted,
@@ -36,7 +36,7 @@ from app.tasks.conn import ingest_queue, maintenance_queue
 from app.tasks.jobs import expand_archive, ingest_document, purge_document, purge_rag
 
 router = APIRouter(
-    prefix="/v1/platform/rags", tags=["rags"], dependencies=[Depends(require_api_key)]
+    prefix="/v1/platform/rags", tags=["rags"]
 )
 
 
@@ -163,6 +163,7 @@ async def put_icon(
     user_id: uuid.UUID = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> RagOut:
+    """SVG не принимаем"""
     if file.content_type not in settings.icon_allowed_types:
         raise HTTPException(
             status_code=415,
@@ -224,7 +225,7 @@ async def upload_documents(
     user_id: uuid.UUID = Depends(current_user),
     session: AsyncSession = Depends(get_session),
 ) -> UploadAccepted:
-    """Объект -> строка -> задача, порядок фиксирован."""
+    """Объект -> строка -> задача, порядок фиксирован"""
     await _owned(session, rag_id, user_id)
     storage = ObjectStorage()
     limit = settings.max_upload_mb * 1024 * 1024

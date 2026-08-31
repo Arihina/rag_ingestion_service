@@ -8,11 +8,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session, repo
-from app.deps import require_api_key
 from app.schemas.rags import InternalRagOut
 
 router = APIRouter(
-    prefix="/v1/internal", tags=["internal"], dependencies=[Depends(require_api_key)]
+    prefix="/v1/internal", tags=["internal"]
 )
 
 

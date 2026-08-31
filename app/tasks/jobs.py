@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-"""Задачи RQ.
-ВОРКЕР НЕ ДЕРЖИТ МОДЕЛЬ. За векторами
-он ходит по HTTP в /embed основного процесса, передавая pool="ingest".
-Причины две.
-"""
+"""Задачи RQ. ВОРКЕР НЕ ДЕРЖИТ МОДЕЛЬ."""
 
 import asyncio
 import hashlib
@@ -64,7 +60,6 @@ async def _ingest_document(document_id: uuid.UUID) -> int:
     embedder = HttpEmbedder(
         settings.self_url,
         batch_size=settings.embed_batch_size,
-        api_key=settings.api_key,
         pool="ingest",
     )
 
@@ -167,7 +162,7 @@ async def _register_document(
     origin: str,
     batch_id: uuid.UUID,
 ) -> uuid.UUID | None:
-    """Объект -> строка -> задача. Порядок важени и фиксирован.
+    """Объект -> строка -> задача. Порядок фиксирован.
 
     Упали после записи объекта — остался осиротевший объект без строки:
     невидим, не мешает, подчищается фоновой сверкой. Обратный порядок хуже:

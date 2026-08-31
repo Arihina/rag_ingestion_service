@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-"""Разделяемое состояние процесса, собирается в lifespan.
-
-Модель живёт ЗДЕСЬ, а не в воркерах.
-"""
+"""Разделяемое состояние процесса, собирается в lifespan."""
 
 import asyncio
 
@@ -22,6 +19,8 @@ class AppState:
     storage: ObjectStorage
     embed_sem: asyncio.Semaphore
     query_sem: asyncio.Semaphore
+    ready: asyncio.Event
 
 
 state = AppState()
+state.ready = asyncio.Event()

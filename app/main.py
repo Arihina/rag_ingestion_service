@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     state.storage = ObjectStorage()
     state.storage.ensure_buckets()
 
+    state.ready.set()
     logger.info("Готов")
     yield
 
@@ -71,13 +72,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await dispose_db()
 
 
-app = FastAPI(title="RAG Ingest API", version="2.0.0", lifespan=lifespan)
+@asynccontextmanager
+async def internal_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Внутреннее приложение своих ресурсов не создаёт — только ждёт чужих.
 
+    Оба сервера стартуют одновременно, и без этого ожидания /embed мог бы
+    принять запрос до загрузки модели.
+    """
+    await state.ready.wait()
+    yield
+
+
+app = FastAPI(title="RAG Ingest", version="2.0.0", lifespan=lifespan)
 app.include_router(health.router)
-app.include_router(embed.router)
 app.include_router(rags.router)
-app.include_router(internal.router)
-app.include_router(admin.router)
+
+internal_app = FastAPI(
+    title="RAG Ingest (internal)", version="2.0.0", lifespan=internal_lifespan
+)
+internal_app.include_router(health.router)
+internal_app.include_router(embed.router)
+internal_app.include_router(internal.router)
+internal_app.include_router(admin.router)
+
+if settings.internal_port == 0:
+    app.include_router(embed.router)
+    app.include_router(internal.router)
+    app.include_router(admin.router)
 
 
 def _error_body(status_code: int, message: str, param: str | None = None) -> dict:
@@ -107,26 +128,78 @@ async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResp
     )
 
 
-@app.exception_handler(Exception)
-async def _unhandled_error(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Необработанная ошибка на %s %s",
-                     request.method, request.url.path)
-    return JSONResponse(
-        status_code=500,
-        content=_error_body(500, f"Внутренняя ошибка: {type(exc).__name__}"),
-    )
+def _install_error_handlers(target: FastAPI) -> None:
+    @target.exception_handler(StarletteHTTPException)
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=_error_body(exc.status_code, str(exc.detail)),
+        )
+
+    @target.exception_handler(RequestValidationError)
+    async def _validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        first = exc.errors()[0] if exc.errors() else {}
+        loc = [
+            str(part)
+            for part in first.get("loc", ())
+            if part not in ("body", "query", "path", "header")
+        ]
+        return JSONResponse(
+            status_code=400,
+            content=_error_body(
+                400, first.get("msg", "Некорректный запрос"), ".".join(
+                    loc) or None
+            ),
+        )
+
+    @target.exception_handler(Exception)
+    async def _unhandled_error(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception(
+            "Необработанная ошибка на %s %s", request.method, request.url.path
+        )
+        return JSONResponse(
+            status_code=500,
+            content=_error_body(
+                500, f"Внутренняя ошибка: {type(exc).__name__}"),
+        )
 
 
-@app.exception_handler(RequestValidationError)
-async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
-    first = exc.errors()[0] if exc.errors() else {}
-    loc = [str(p) for p in first.get("loc", ())
-           if p not in ("body", "query", "path", "header")]
-    return JSONResponse(
-        status_code=400,
-        content=_error_body(400, first.get(
-            "msg", "Некорректный запрос"), ".".join(loc) or None),
-    )
+_install_error_handlers(app)
+_install_error_handlers(internal_app)
+
+
+async def _serve() -> None:
+    """Два сервера в одном процессе."""
+    import uvicorn
+
+    def server(target: FastAPI, host: str, port: int) -> "uvicorn.Server":
+        return uvicorn.Server(
+            uvicorn.Config(
+                target,
+                host=host,
+                port=port,
+                log_level=settings.log_level,
+                timeout_keep_alive=settings.timeout_keep_alive,
+            )
+        )
+
+    public = server(app, settings.host, settings.port)
+    logger.info("Платформенный порт: %s:%s", settings.host, settings.port)
+
+    if settings.internal_port == 0:
+        logger.warning(
+            "internal_port=0 — служебные ручки открыты на платформенном порту"
+        )
+        await public.serve()
+        return
+
+    private = server(internal_app, settings.internal_host,
+                     settings.internal_port)
+    logger.info("Внутренний порт: %s:%s",
+                settings.internal_host, settings.internal_port)
+    await asyncio.gather(public.serve(), private.serve())
 
 
 def run() -> None:
@@ -140,16 +213,20 @@ def run() -> None:
 
     if settings.reload:
         logger.warning(
-            "reload включён: модели будут перезагружаться на каждую правку")
+            "reload включён: порты НЕ разводятся, модели перезагружаются "
+            "на каждую правку"
+        )
+        uvicorn.run(
+            "app.main:app",
+            host=settings.host,
+            port=settings.port,
+            reload=True,
+            log_level=settings.log_level,
+            timeout_keep_alive=settings.timeout_keep_alive,
+        )
+        return
 
-    uvicorn.run(
-        "app.main:app",
-        host=settings.host,
-        port=settings.port,
-        reload=settings.reload,
-        log_level=settings.log_level,
-        timeout_keep_alive=settings.timeout_keep_alive,
-    )
+    asyncio.run(_serve())
 
 
 if __name__ == "__main__":
