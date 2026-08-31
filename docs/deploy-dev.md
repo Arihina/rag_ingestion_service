@@ -128,6 +128,10 @@ psql postgresql://rag:rag@localhost:5432/rag_ingest -c '\dt'
 python -m app.main
 ```
 
+Поднимаются два порта: 8011 (`/health`, `/v1/platform/*`) и 8012
+(`/embed`, `/v1/internal/*`, `/admin/*`). Зачем — в
+[`ports.md`](ports.md).
+
 ```bash
 rq worker -u redis://localhost:6379/1 ingest maintenance
 ```
@@ -137,7 +141,7 @@ rq worker -u redis://localhost:6379/1 ingest maintenance
 `INGEST_SELF_URL`.
 
 ```bash
-curl -s localhost:8000/health | jq
+curl -s localhost:8011/health | jq
 ```
 
 Все пять флагов должны быть `true`.
@@ -207,7 +211,7 @@ docker compose -f docker-compose.dev.yml exec api alembic upgrade head
 Переменные окружения не переживают смену терминала. В каждом новом окне:
 
 ```bash
-export API=http://localhost:8000
+export API=http://localhost:8011
 export U=11111111-1111-1111-1111-111111111111
 export RAG=<id набора>
 ```

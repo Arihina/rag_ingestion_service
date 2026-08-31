@@ -51,7 +51,6 @@ OPENSEARCH_PASSWORD=...
 POSTGRES_PASSWORD=...
 S3_ACCESS_KEY=...
 S3_SECRET_KEY=...
-INGEST_API_KEY=...
 INGEST_IMAGE_API=registry.internal/rag-ingest-api@sha256:...
 INGEST_IMAGE_WORKER=registry.internal/rag-ingest-worker@sha256:...
 ```
@@ -126,7 +125,7 @@ docker compose -f docker-compose.prod.yml exec api alembic upgrade head
 
 ```bash
 docker compose -f docker-compose.prod.yml exec api \
-  curl -s localhost:8000/health | jq
+  curl -s localhost:8011/health | jq
 ```
 
 Все пять флагов `true`. Наружу `api` не публикуется — доступ через мастер.
@@ -142,7 +141,7 @@ docker compose -f docker-compose.prod.yml exec api \
 | Веса | том с весами docling | том `models`, `HF_HUB_OFFLINE=1` |
 | OpenSearch | без TLS | TLS + пароль |
 | SeaweedFS | порты на localhost | наружу не публикуется вовсе |
-| API-ключ | выключен | обязателен |
+| Порты наружу | 8011 на localhost | ни одного |
 | Реплик `api` | 1 | 1 |
 | Реплик `worker` | 1 | 2 (подбирается) |
 
@@ -226,9 +225,10 @@ WHERE status = 'processing' AND updated_at < now() - interval '1 hour';
 
 ## Чего пока нет
 
-- **Защиты `/admin` отдельно от `INGEST_API_KEY`** — та же заглушка, что и
-  в мастере, до Keycloak. Наружу сервис не торчит, но внутри сети разделения
-  прав нет.
+- **Разграничения прав внутри сети.** `/admin` и `/embed` вынесены на
+  внутренний порт (см. [`ports.md`](ports.md)), но между сервисами
+  платформы барьеров нет: воркеру нужен только `/embed`, а доступен весь
+  порт. `X-User-Id` при этом остаётся доверенным — снимается Keycloak.
 - **Фоновой сверки осиротевших объектов** в SeaweedFS. Порядок записи
   (объект → строка → задача) сделан так, чтобы осиротевший объект был
   безвредным, но со временем они копятся.
