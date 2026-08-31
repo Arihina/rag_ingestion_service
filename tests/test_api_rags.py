@@ -42,6 +42,11 @@ class ApiTestCase(FixtureTestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Настоящее приложение, а не сборка роутеров руками: так
+        # проверяется и проводка, и обработчики ошибок (без них
+        # невалидное тело давало бы 422 вместо 400). TestClient без
+        # контекстного менеджера lifespan не запускает, поэтому модели
+        # и клиенты не поднимаются.
         from app.main import app
 
         session = AsyncMock()
@@ -63,6 +68,8 @@ class AuthTests(ApiTestCase):
         self.assertEqual(self.client.get("/v1/platform/rags").status_code, 401)
 
     def test_не_uuid_даёт_401(self):
+        # Значение ASCII намеренно: заголовки HTTP — latin-1, и кириллица
+        # не дойдёт до приложения, упав раньше, в клиенте.
         for value in ("not-a-uuid", "12345", ""):
             with self.subTest(value=value):
                 response = self.client.get(
@@ -209,3 +216,58 @@ class AdminRoutingTests(ApiTestCase):
         for route in admin.router.routes:
             self.assertFalse(route.path.startswith("/v1"), route.path)
             self.assertTrue(route.path.startswith("/admin"), route.path)
+
+
+class PortSeparationTests(ApiTestCase):
+    """Разведение портов — единственный барьер после удаления API-ключа,
+    поэтому состав ручек на каждом порту проверяется явно."""
+
+    @staticmethod
+    def _paths(application) -> set[str]:
+        return set(application.openapi()["paths"])
+
+    def test_служебных_ручек_нет_на_платформенном_порту(self):
+        from app.main import app
+
+        for prefix in ("/embed", "/v1/internal", "/admin"):
+            self.assertFalse(
+                any(p.startswith(prefix) for p in self._paths(app)),
+                f"{prefix} доступен на платформенном порту",
+            )
+
+    def test_платформенных_ручек_нет_на_внутреннем_порту(self):
+        """Обратное тоже важно: /v1/platform скоупится по X-User-Id,
+        и открывать его там, где заголовок никто не проставляет, незачем."""
+        from app.main import internal_app
+
+        self.assertFalse(
+            any(p.startswith("/v1/platform")
+                for p in self._paths(internal_app))
+        )
+
+    def test_служебные_ручки_есть_на_внутреннем_порту(self):
+        from app.main import internal_app
+
+        paths = self._paths(internal_app)
+        self.assertIn("/embed", paths)
+        self.assertIn("/v1/internal/rags/{rag_id}", paths)
+
+    def test_health_есть_на_обоих(self):
+        """Проверять живость должны и мастер, и оркестратор контейнеров."""
+        from app.main import app, internal_app
+
+        self.assertIn("/health", self._paths(app))
+        self.assertIn("/health", self._paths(internal_app))
+
+    def test_единый_формат_ошибок_на_обоих_портах(self):
+        from app.main import app, internal_app
+
+        for application in (app, internal_app):
+            with self.subTest(app=application.title):
+                self.assertIn(Exception, application.exception_handlers)
+
+    def test_self_url_указывает_на_внутренний_порт(self):
+        """Воркер ходит за векторами именно туда."""
+        from app.config import settings
+
+        self.assertIn(str(settings.internal_port), settings.self_url)

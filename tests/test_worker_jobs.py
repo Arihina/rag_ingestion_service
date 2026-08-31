@@ -52,7 +52,8 @@ class TransferModeTests(AsyncFixtureTestCase):
                       MagicMock(return_value=storage)),
                 patch("app.tasks.jobs.session_scope", scope),
                 patch("app.tasks.jobs.IngestPipeline", pipeline),
-
+                # close() у клиента OpenSearch awaitable — обычный MagicMock
+                # тут падает на await.
                 patch("app.tasks.jobs._opensearch",
                       MagicMock(return_value=self._os_client())),
                 patch("app.tasks.jobs.HttpEmbedder", MagicMock()),
@@ -97,20 +98,49 @@ class TransferModeTests(AsyncFixtureTestCase):
 
 
 class EmbedderPoolTests(FixtureTestCase):
+    """Адрес здесь — внутренний порт (8012), как в реальном развёртывании:
+    /embed на платформенном порту отсутствует вовсе."""
+
     def test_воркер_ходит_в_пул_ingest(self):
         """Иначе воркеры и чат встают в общую очередь к одной карте."""
         from app.embeddings import HttpEmbedder
 
-        embedder = HttpEmbedder("http://api:8000", pool="ingest")
+        embedder = HttpEmbedder("http://api:8012", pool="ingest")
         self.addCleanup(embedder.close)
         self.assertEqual(embedder._pool, "ingest")
 
     def test_по_умолчанию_пул_query(self):
         from app.embeddings import HttpEmbedder
 
-        embedder = HttpEmbedder("http://api:8000")
+        embedder = HttpEmbedder("http://api:8012")
         self.addCleanup(embedder.close)
         self.assertEqual(embedder._pool, "query")
+
+    def test_запрос_уходит_на_переданный_адрес(self):
+        """Опечатка в SELF_URL даёт 404 на каждой задаче индексации, и
+        видно это только в логе воркера."""
+        import httpx
+        from app.embeddings import HttpEmbedder
+
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            return httpx.Response(200, json={
+                "model": "BAAI/bge-m3",
+                "embeddings": [{"dense": [0.0] * 1024, "sparse": {}}],
+            })
+
+        embedder = HttpEmbedder("http://api:8012/")
+        embedder.close()
+        embedder._client = httpx.Client(
+            transport=httpx.MockTransport(handler), timeout=1.0
+        )
+        try:
+            embedder.embed(["текст"])
+        finally:
+            embedder.close()
+        self.assertEqual(seen["url"], "http://api:8012/embed")
 
     def test_pool_уходит_в_тело_запроса(self):
         import httpx
@@ -125,7 +155,9 @@ class EmbedderPoolTests(FixtureTestCase):
                 "embeddings": [{"dense": [0.0] * 1024, "sparse": {}}],
             })
 
-        embedder = HttpEmbedder("http://api:8000", pool="ingest")
+        embedder = HttpEmbedder("http://api:8012", pool="ingest")
+        # Дефолтный таймаут HttpEmbedder — 120 секунд: промах мимо
+        # заглушки подвесил бы прогон, а не уронил его.
         embedder.close()
         embedder._client = httpx.Client(
             transport=httpx.MockTransport(handler), timeout=1.0

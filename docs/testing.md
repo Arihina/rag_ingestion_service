@@ -12,7 +12,7 @@ source venv/bin/activate
 python -m unittest discover -s tests -t .
 ```
 
-137 тестов, около секунды. Внешних сервисов не требуется: Postgres, Redis,
+148 тестов, около двух секунд. Внешних сервисов не требуется: Postgres, Redis,
 SeaweedFS, OpenSearch и docling подменяются. Модель эмбеддингов не
 загружается — `FlagEmbedding` импортируется лениво внутри `BgeM3Embedder`,
 и до него тесты не доходят.
@@ -42,7 +42,7 @@ python -m unittest discover -s tests -t . -f              # стоп на пер
 | `test_repo_queries.py` | владение внутри SQL, инварианты схемы |
 | `test_storage.py` | ключи, подпись ссылок под чужим хостом, стрим |
 | `test_worker_jobs.py` | режимы передачи файла в docling, пул эмбеддера |
-| `test_api_rags.py` | коды ответов, скоупинг, валидация, иконки |
+| `test_api_rags.py` | коды ответов, скоупинг, валидация, иконки, разведение портов |
 
 ### Принципы
 
@@ -59,6 +59,12 @@ bulk.
 
 **SQL проверяется по структуре.** Живого Postgres нет, поэтому запросы
 компилируются под диалект и проверяются на наличие условий владения.
+
+**Состав ручек на портах проверяется явно.** После удаления API-ключа
+разведение портов — единственный барьер вокруг служебных эндпоинтов, и
+ошибка здесь не даёт исключения: приложение поднимется, просто `/admin`
+окажется там, где не должен. `PortSeparationTests` сверяет обе стороны —
+что служебного нет на платформенном порту и наоборот.
 
 **API тестируется на настоящем приложении.** Не сборкой роутеров руками:
 без обработчиков ошибок из `main.py` невалидное тело давало бы `422`
@@ -103,10 +109,15 @@ done
 переживают смену терминала — задавай в каждом окне:
 
 ```bash
-export API=http://localhost:8000
+export API=http://localhost:8011       # платформенный: /health, /v1/platform/*
+export INT=http://localhost:8012       # внутренний: /embed, /v1/internal, /admin
 export U=11111111-1111-1111-1111-111111111111
 export V=22222222-2222-2222-2222-222222222222
 ```
+
+Две переменные, а не одна: служебные ручки на платформенном порту
+отсутствуют и дадут `404`. Если запускаешь с `INGEST_INTERNAL_PORT=0`,
+`INT` совпадает с `API`. Подробнее — в [`ports.md`](ports.md).
 
 ### 1. Инфраструктура
 
@@ -114,7 +125,43 @@ export V=22222222-2222-2222-2222-222222222222
 curl -s $API/health | jq
 ```
 
-Все пять флагов `true`.
+Все пять флагов `true`. `/health` есть на обоих портах:
+
+```bash
+curl -s $INT/health | jq .status
+```
+
+### 1а. Разведение портов
+
+Единственный барьер вокруг служебных ручек после удаления API-ключа,
+поэтому проверяется до всего остального.
+
+```bash
+# состав ручек на каждом порту
+curl -s $API/openapi.json | jq -r '.paths | keys[]'
+curl -s $INT/openapi.json | jq -r '.paths | keys[]'
+
+# служебных на платформенном быть не должно
+curl -s -o /dev/null -w "%{http_code} " $API/embed
+curl -s -o /dev/null -w "%{http_code} " $API/admin/staging
+curl -s -o /dev/null -w "%{http_code}\n" "$API/v1/internal/rags/00000000-0000-0000-0000-000000000000?user_id=$U"
+```
+
+Три `404` подряд. Обратное тоже верно — платформенных ручек нет на
+внутреннем порту:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" $INT/v1/platform/rags -H "X-User-Id: $U"   # 404
+```
+
+В контейнерах внутренний порт достижим соседям, но не хосту:
+
+```bash
+docker compose -f docker-compose.dev.yml exec worker \
+  sh -c 'wget -q -O- http://api:8012/health >/dev/null && echo "из сети — ОК"'
+curl -s --max-time 2 localhost:8012/health >/dev/null \
+  || echo "снаружи недоступен — так и надо"
+```
 
 ### 2. Набор и валидация
 
@@ -212,7 +259,7 @@ breadcrumb не собирается, и `_extract_texts` в `app/docling/client
 ### 8. `/embed`
 
 ```bash
-curl -s -X POST $API/embed -H "Content-Type: application/json" \
+curl -s -X POST $INT/embed -H "Content-Type: application/json" \
   -d '{"texts":["поверка приборов","расторжение договора"],"pool":"query"}' \
   | jq '{model, n:(.embeddings|length), dim:(.embeddings[0].dense|length),
          sparse:(.embeddings[0].sparse|length)}'
@@ -224,13 +271,13 @@ curl -s -X POST $API/embed -H "Content-Type: application/json" \
 ### 9. Внутренняя ручка
 
 ```bash
-curl -s "$API/v1/internal/rags/$RAG?user_id=$U" | jq
-curl -s -o /dev/null -w "%{http_code}\n" "$API/v1/internal/rags/$RAG?user_id=$V"  # 404
+curl -s "$INT/v1/internal/rags/$RAG?user_id=$U" | jq
+curl -s -o /dev/null -w "%{http_code}\n" "$INT/v1/internal/rags/$RAG?user_id=$V"  # 404
 
 # правка конфига видна сразу
 curl -s -X PATCH $API/v1/platform/rags/$RAG -H "Content-Type: application/json" \
   -H "X-User-Id: $U" -d '{"prompt":"Отвечай кратко.","temperature":0.1}' > /dev/null
-curl -s "$API/v1/internal/rags/$RAG?user_id=$U" | jq '{prompt,temperature}'
+curl -s "$INT/v1/internal/rags/$RAG?user_id=$U" | jq '{prompt,temperature}'
 ```
 
 ### 10. Иконки
