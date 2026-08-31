@@ -21,6 +21,7 @@
 - [`docs/deploy-dev.md`](docs/deploy-dev.md) — зависимости в Docker, сервис с хоста
 - [`docs/deploy-prod.md`](docs/deploy-prod.md) — всё в контейнерах, образы из реестра
 - [`docs/testing.md`](docs/testing.md) — юнит-тесты и ручной интеграционный прогон
+- [`docs/ports.md`](docs/ports.md) — разведение портов и что оно защищает
 
 Ниже — устройство сервиса и справочник по API.
 
@@ -70,7 +71,7 @@
                         │  без модели  │
                         │  без GPU     │
                         └──┬────────┬──┘
-                           │        │  вектора по HTTP → api:8000/embed
+                           │        │  вектора по HTTP → api:8012/embed
                            ▼        ▼
                     ┌────────────┐  ┌──────────────┐
                     │  docling   │  │  OpenSearch  │
@@ -179,7 +180,7 @@ docker-compose.prod.yml
 docker-compose.opensearch.yml   только OpenSearch, если docling живёт отдельно
 ```
 
-Каталог назван `app/tasks/`, а не `app/queue/`, потому что `queue` есть в
+Каталог назван `app/tasks/`, а не `app/tasks/`, потому что `queue` есть в
 стандартной библиотеке: затенения при абсолютных импортах не будет, но читать
 такой импорт неприятно, а рано или поздно кто-то напишет относительный.
 
@@ -252,7 +253,7 @@ easyocr, rapidocr и **веса bge-m3 целиком** (~5 ГБ), после ч
 Проверка:
 
 ```bash
-curl -s localhost:8000/health | jq
+curl -s localhost:8011/health | jq
 # {"status":"ok","docling":true,"opensearch":true,"postgres":true,
 #  "redis":true,"storage":true,"model":"BAAI/bge-m3"}
 ```
@@ -339,10 +340,11 @@ docling, а не на нашей стороне.
 
 | Переменная | По умолчанию | Комментарий |
 |---|---|---|
-| `INGEST_HOST` / `INGEST_PORT` | `127.0.0.1` / `8000` | |
+| `INGEST_HOST` / `INGEST_PORT` | `127.0.0.1` / `8011` | платформенный порт |
+| `INGEST_INTERNAL_HOST` / `INGEST_INTERNAL_PORT` | `127.0.0.1` / `8012` | служебный, наружу не публикуется |
 | `INGEST_RELOAD` | `false` | модели перезагружаются на каждую правку |
 | `INGEST_TIMEOUT_KEEP_ALIVE` | `300` | под большие загрузки |
-| `INGEST_SELF_URL` | `http://localhost:8000` | **куда воркер ходит за векторами** |
+| `INGEST_SELF_URL` | `http://localhost:8011` | **куда воркер ходит за векторами** |
 | `INGEST_DOCLING_URL` | `http://localhost:5001` | |
 | `INGEST_OPENSEARCH_URL` | `http://localhost:9200` | |
 | `INGEST_INDEX_NAME` | `kb-v2` | |
@@ -359,7 +361,6 @@ docling, а не на нашей стороне.
 | `INGEST_ARCHIVE_MAX_*` | см. ниже | **серверные**, не пользовательские |
 | `INGEST_RAG_MAX_SETS_PER_OWNER` | `50` | |
 | `INGEST_RAG_MAX_BYTES_PER_SET` | 20 ГБ | |
-| `INGEST_API_KEY` | — | если задан, требуется `X-Api-Key` |
 
 В docker-compose адреса — имена сервисов, а не `localhost`: воркер живёт в
 отдельном контейнере и до `localhost` родителя не достучится.
@@ -402,7 +403,7 @@ GET    /v1/platform/rags/{id}/icon
 ```bash
 U=11111111-1111-1111-1111-111111111111
 
-curl -X POST localhost:8000/v1/platform/rags \
+curl -X POST localhost:8011/v1/platform/rags \
   -H "Content-Type: application/json" -H "X-User-Id: $U" \
   -d '{"name": "Регламенты", "top_k": 5, "score_threshold": 0.4}'
 ```
@@ -431,7 +432,7 @@ GET    /v1/platform/rags/{id}/imports/{batch_id}
 ```
 
 ```bash
-curl -X POST localhost:8000/v1/platform/rags/$RAG/documents \
+curl -X POST localhost:8011/v1/platform/rags/$RAG/documents \
   -H "X-User-Id: $U" -F "files=@a.pdf" -F "files=@b.docx"
 ```
 
@@ -474,7 +475,7 @@ GET  /admin/staging?prefix=
 ### `POST /embed`
 
 ```bash
-curl -X POST localhost:8000/embed \
+curl -X POST localhost:8011/embed \
   -H "Content-Type: application/json" \
   -d '{"texts": ["порядок расторжения договора"], "pool": "query"}'
 ```
@@ -907,7 +908,8 @@ faiss/`cosinesimil` OpenSearch отдаёт `1 / (1 + cosineDistance)`, где
 
 **Воркер падает на `/embed` с `Connection refused`**
 `INGEST_SELF_URL` указывает на `localhost`, а воркер живёт в отдельном
-контейнере. В compose должно быть имя сервиса — `http://api:8000`.
+контейнере, либо указывает на платформенный порт вместо внутреннего.
+В compose должно быть `http://api:8012`.
 
 **Чат тормозит во время заливки корпуса**
 Оба сценария делят один экземпляр модели. Включи

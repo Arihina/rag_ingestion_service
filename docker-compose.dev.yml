@@ -4,9 +4,9 @@
 # Dockerfile можно удалить.
 #
 # Перед первым запуском ОДИН РАЗ на хосте:
-#   mkdir -p /home/{USER}/storage/docling-models
-#   sudo chown -R 1001:0 /home/{USER}/storage/docling-models
-#   sudo chmod -R g+rwX /home/{USER}/storage/docling-models
+#   mkdir -p /home/dodo/storage/docling-models
+#   sudo chown -R 1001:0 /home/dodo/storage/docling-models
+#   sudo chmod -R g+rwX /home/dodo/storage/docling-models
 
 x-docling-image: &docling-image ghcr.io/docling-project/docling-serve-cu128:v1.21.0
 
@@ -19,7 +19,10 @@ services:
       - plugins.security.disabled=true
       - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Opensearch1!
       - bootstrap.memory_lock=true
+      # 512m хватало на e5-small; с 1024-мерными векторами bge-m3 мало.
       - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
+      # HNSW-графы живут ВНЕ heap: лимит отдельный, считается
+      # от памяти контейнера — отсюда mem_limit ниже.
       - knn.memory.circuit_breaker.limit=60%
     ulimits:
       memlock:
@@ -52,6 +55,9 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
+      # -U обязателен: без него pg_isready проверяется под пользователем
+      # postgres, которого в этом образе с заданным POSTGRES_USER нет,
+      # и healthcheck зелёный при неготовой базе.
       test: ["CMD-SHELL", "pg_isready -U rag -d rag_ingest"]
       interval: 5s
       timeout: 5s
@@ -60,6 +66,9 @@ services:
   redis:
     image: redis:7-alpine
     container_name: redis-rag
+    # appendonly: очередь RQ переживает рестарт контейнера. Без него
+    # задачи, поставленные за последнюю минуту, теряются молча, а
+    # документы остаются в pending навсегда.
     command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "127.0.0.1:6379:6379"
@@ -71,6 +80,11 @@ services:
       timeout: 3s
       retries: 10
 
+  # Одна нода: master, volume, filer и S3-шлюз в одном процессе.
+  # Разносить роли имеет смысл, только когда упрёмся.
+  #
+  # -dir общий для всех ролей, поэтому том один.
+  # -s3.config задаёт identity: без него шлюз пускает анонимно.
   seaweedfs:
     image: chrislusf/seaweedfs:3.98
     container_name: seaweedfs-rag
@@ -78,6 +92,8 @@ services:
       - server
       - -dir=/data
       - -master.volumeSizeLimitMB=1024
+      # Явное число, а не 0: ноль означает 'посчитать по свободному
+      # месту', и результат зависит от того, что вернёт ФС тома.
       - -volume.max=100
       - -filer
       - -s3
@@ -89,6 +105,11 @@ services:
       - "127.0.0.1:8888:8888"   # filer
     volumes:
       - seaweedfs-data:/data
+      # Монтируется КАТАЛОГ, а не файл. При bind-mount одиночного файла
+      # Docker молча создаёт на его месте пустой каталог, если файла нет,
+      # и weed падает с 'is a directory' — причём уже после того, как
+      # master, volume и filer успешно поднялись, так что в общем логе
+      # это выглядит как сбой всего сервиса.
       - ./deploy:/etc/seaweedfs:ro
     healthcheck:
       # 127.0.0.1, а НЕ localhost: /etc/hosts в alpine резолвит localhost
@@ -194,7 +215,11 @@ services:
               capabilities: [gpu]
 
   # Профиль app: обычный `up -d` поднимает ТОЛЬКО зависимости, а сервис и
-  # воркер запускаются с хоста в venv.
+  # воркер запускаются с хоста в venv. Для дева это быстрее во всём:
+  # образ api весит ~6 ГБ из-за torch и собирается минутами, отладчик к
+  # процессу в контейнере не подцепить, а перезапуск после правки моделей
+  # всё равно полный. Контейнеры нужны для проверки самой сборки — тогда
+  # `--profile app up -d --build`.
   api:
     profiles: ["app"]
     build:
@@ -205,16 +230,23 @@ services:
     environment:
       # Внутри сети compose всё по именам сервисов, не по localhost.
       INGEST_HOST: 0.0.0.0
+      # Внутренний порт слушает 0.0.0.0, но НЕ публикуется на хост:
+      # в сети compose до него дотягиваются воркеры, снаружи — никто.
+      INGEST_INTERNAL_HOST: 0.0.0.0
       INGEST_DOCLING_URL: http://docling:5001
       INGEST_OPENSEARCH_URL: http://opensearch:9200
       INGEST_DATABASE_URL: postgresql+asyncpg://rag:rag@postgres:5432/rag_ingest
       INGEST_REDIS_URL: redis://redis:6379/1
       INGEST_S3_ENDPOINT_URL: http://seaweedfs:8333
+      # В контейнере api и docling в одной сети — адреса совпадают.
+      INGEST_S3_PRESIGN_ENDPOINT_URL: http://seaweedfs:8333
       HF_HOME: /models/hf
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8011:8011"
     volumes:
       - /home/dodo/storage/docling-models:/models
+      # Исходники томом — ради INGEST_RELOAD. В проде этой строки нет:
+      # там работает код, который лёг в образ.
       - ./app:/srv/app:ro
     depends_on:
       opensearch: { condition: service_healthy }
@@ -230,6 +262,8 @@ services:
               count: 1
               capabilities: [gpu]
 
+  # Модель НЕ держит: за векторами ходит в api:8000/embed.
+  # Отсюда ни torch, ни проброса GPU.
   worker:
     profiles: ["app"]
     build:
@@ -242,8 +276,13 @@ services:
       INGEST_DATABASE_URL: postgresql+asyncpg://rag:rag@postgres:5432/rag_ingest
       INGEST_REDIS_URL: redis://redis:6379/1
       INGEST_S3_ENDPOINT_URL: http://seaweedfs:8333
-      INGEST_SELF_URL: http://api:8000
+      INGEST_S3_PRESIGN_ENDPOINT_URL: http://seaweedfs:8333
+      INGEST_SELF_URL: http://api:8012
     volumes:
+      # Тот же том, что у api. Без него воркер крутил бы код, запечённый
+      # в образ, пока api работает со свежим — расхождение молчаливое
+      # и находится долго. Перечитывает код воркер только при рестарте:
+      # docker compose restart worker
       - ./app:/srv/app:ro
     depends_on:
       api: { condition: service_started }
