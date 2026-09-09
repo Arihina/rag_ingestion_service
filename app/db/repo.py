@@ -222,3 +222,24 @@ async def record_job(
     job = IngestJob(document_id=document_id, rq_job_id=rq_job_id)
     session.add(job)
     return job
+
+
+async def documents_by_ids(
+    session: AsyncSession, document_ids: list[uuid.UUID], owner_id: uuid.UUID
+) -> list[Document]:
+    """Документы владельца по списку идентификаторов."""
+    if not document_ids:
+        return []
+    return list(
+        (
+            await session.execute(
+                select(Document)
+                .join(RagSet, RagSet.id == Document.rag_id)
+                .where(
+                    Document.id.in_(set(document_ids)),
+                    RagSet.owner_id == owner_id,
+                    RagSet.deleted_at.is_(None),
+                )
+            )
+        ).scalars()
+    )

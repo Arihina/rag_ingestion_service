@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-"""Внутренняя ручка для agentic_rag. Через мастер НЕ проксируется."""
+"""Внутренние ручки для agentic_rag. Через мастер НЕ проксируется.
+
+Путь намеренно под /v1/internal, а не /v1/platform: catch-all мастера
+форвардит любой путь под v1/, поэтому наружу её закрывает сеть, а не
+маршрутизация. Отдельный порт или сетевая политика обязательны.
+"""
 
 import uuid
 
@@ -8,7 +13,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session, repo
-from app.schemas.rags import InternalRagOut
+from app.schemas.rags import (
+    DocumentEntry,
+    DocumentLookupIn,
+    DocumentLookupOut,
+    InternalRagOut,
+)
 
 router = APIRouter(
     prefix="/v1/internal", tags=["internal"]
@@ -35,4 +45,24 @@ async def internal_rag(
         temperature=rag.temperature,
         top_k=rag.top_k,
         score_threshold=rag.score_threshold,
+    )
+
+
+@router.post("/documents/lookup", response_model=DocumentLookupOut)
+async def lookup_documents(
+    payload: DocumentLookupIn,
+    user_id: uuid.UUID = Query(...),
+    session: AsyncSession = Depends(get_session),
+) -> DocumentLookupOut:
+    """Имена документов по идентификаторам — для подписей под цитатами."""
+    documents = await repo.documents_by_ids(session, payload.document_ids, user_id)
+    return DocumentLookupOut(
+        documents=[
+            DocumentEntry(
+                document_id=document.id,
+                filename=document.filename,
+                rag_id=document.rag_id,
+            )
+            for document in documents
+        ]
     )

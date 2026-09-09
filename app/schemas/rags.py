@@ -111,6 +111,8 @@ class BatchOut(BaseModel):
 
 
 class InternalRagOut(BaseModel):
+    """Ответ agentic_rag: конфиг набора плюс подтверждение владения."""
+
     id: uuid.UUID
     name: str
     status: str
@@ -118,3 +120,21 @@ class InternalRagOut(BaseModel):
     temperature: float
     top_k: int
     score_threshold: float
+
+
+class DocumentLookupIn(BaseModel):
+    """Batch-подстановка имён по идентификаторам документов."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    document_ids: list[uuid.UUID] = Field(min_length=1, max_length=100)
+
+
+class DocumentEntry(BaseModel):
+    document_id: uuid.UUID
+    filename: str
+    rag_id: uuid.UUID
+
+
+class DocumentLookupOut(BaseModel):
+    documents: list[DocumentEntry]
