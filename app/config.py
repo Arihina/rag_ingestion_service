@@ -42,7 +42,7 @@ class Settings(BaseSettings):
 
     max_upload_mb: int = 200
 
-    database_url: str = "postgresql+asyncpg://rag:rag@localhost:5432/rag_ingest"
+    database_url: str = "postgresql+asyncpg://rag:rag@localhost:5437/rag_ingest"
     db_pool_size: int = 10
     db_max_overflow: int = 20
 
@@ -72,8 +72,7 @@ class Settings(BaseSettings):
 
     icon_max_bytes: int = 512 * 1024
     icon_size_px: int = 256
-    icon_allowed_types: tuple[str, ...] = (
-        "image/png", "image/jpeg", "image/webp")
+    icon_allowed_types: tuple[str, ...] = ("image/png", "image/jpeg", "image/webp")
 
     rag_default_temperature: float = 0.3
     rag_default_top_k: int = 5
@@ -81,6 +80,9 @@ class Settings(BaseSettings):
     rag_top_k_max: int = 10
     rag_prompt_max_chars: int = 4000
     rag_max_sets_per_owner: int = 50
+
+    bucket_import_max_file_size: int = 50 * 1024**2
+    bucket_import_max_files: int = 500
     rag_max_bytes_per_set: int = 20 * 1024**3
 
     embed_concurrency: int = 1

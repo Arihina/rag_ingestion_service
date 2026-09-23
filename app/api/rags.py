@@ -20,15 +20,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db import Document, ImportBatch, RagSet, get_session, repo
 from app.deps import current_user
+from app.bucket_import import (
+    Rejected,
+    Selection,
+    content_hash_for,
+    drop_known,
+    select,
+)
 from app.schemas.rags import (
+    AcceptedDocument,
     BatchOut,
+    DocumentsFromBucketIn,
+    DocumentsFromBucketOut,
     DocumentAccepted,
     DocumentCountsOut,
     DocumentOut,
     RagConfig,
     RagCreate,
+    FromBucketOut,
+    RagFromBucketIn,
     RagOut,
     RagUpdate,
+    RejectedDocument,
     UploadAccepted,
 )
 from app.storage import ObjectStorage, document_key, stream_upload
@@ -73,6 +86,64 @@ async def _owned(session: AsyncSession, rag_id: uuid.UUID, user_id: uuid.UUID) -
     return rag
 
 
+async def _register_remote(
+    session: AsyncSession,
+    rag_id: uuid.UUID,
+    bucket: str,
+    objects: list,
+) -> list[AcceptedDocument]:
+    """Зарегистрировать ссылки на чужие объекты и поставить их в очередь.
+
+    Файлы НЕ копируются: в documents уходит source_bucket + storage_key,
+    воркер читает оттуда же.
+    """
+    accepted: list[AcceptedDocument] = []
+    for obj in objects:
+        document_id = uuid.uuid4()
+        session.add(
+            Document(
+                id=document_id,
+                rag_id=rag_id,
+                filename=obj.filename,
+                size_bytes=obj.size,
+                content_hash=content_hash_for(bucket, obj),
+                storage_key=obj.key,
+                source_bucket=bucket,
+                origin="bucket",
+            )
+        )
+        accepted.append(AcceptedDocument(
+            document_id=document_id, source_key=obj.key))
+    await session.commit()
+
+    for item in accepted:
+        job = ingest_queue().enqueue(ingest_document, str(item.document_id))
+        await repo.record_job(session, item.document_id, job.id)
+    await session.commit()
+    return accepted
+
+
+def _collect(storage: ObjectStorage, payload) -> tuple[list, list[Rejected]]:
+    """Собрать объекты по явным ключам либо по префиксу."""
+    if payload.keys:
+        objects, missing = [], []
+        for key in dict.fromkeys(payload.keys):
+            obj = storage.head_object(payload.bucket, key)
+            if obj is None:
+                missing.append(Rejected(key, "объект не найден"))
+            else:
+                objects.append(obj)
+        return objects, missing
+
+    objects = storage.list_objects(
+        payload.bucket,
+        payload.prefix or "",
+        recursive=payload.recursive,
+        limit=settings.bucket_import_max_files * 2,
+    )
+    return objects, []
+
+
 @router.post("", response_model=RagOut, status_code=status.HTTP_201_CREATED)
 async def create_rag(
     payload: RagCreate,
@@ -95,6 +166,77 @@ async def create_rag(
             status_code=409, detail="Набор с таким именем уже есть")
     await session.refresh(rag)
     return _to_out(rag, repo.DocumentCounts())
+
+
+@router.post(
+    "/from-bucket", response_model=FromBucketOut, status_code=status.HTTP_202_ACCEPTED
+)
+async def create_from_bucket(
+    payload: RagFromBucketIn,
+    user_id: uuid.UUID = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> FromBucketOut:
+    """Создать набор из файлов, уже лежащих в хранилище."""
+    storage = ObjectStorage()
+    if not storage.bucket_exists(payload.bucket):
+        raise HTTPException(
+            status_code=404, detail=f"Бакет {payload.bucket} не найден")
+
+    objects = storage.list_objects(
+        payload.bucket,
+        payload.prefix,
+        recursive=payload.recursive,
+        limit=settings.bucket_import_max_files * 2,
+    )
+    if not objects:
+        raise HTTPException(
+            status_code=400,
+            detail=f"По префиксу {payload.prefix!r} в {payload.bucket} нет объектов",
+        )
+
+    selection = select(payload.bucket, objects, payload.extensions)
+    if not selection.accepted:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Ни один из {selection.total} объектов не подошёл: "
+                f"{selection.rejected[0].reason}"
+            ),
+        )
+
+    if await repo.count_rags(session, user_id) >= settings.rag_max_sets_per_owner:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Достигнут предел в {settings.rag_max_sets_per_owner} наборов",
+        )
+
+    rag = RagSet(owner_id=user_id, **payload.model_dump(
+        exclude={"bucket", "prefix", "recursive", "extensions"}
+    ))
+    session.add(rag)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409, detail="Набор с таким именем уже есть")
+    await session.refresh(rag)
+
+    accepted = await _register_remote(
+        session, rag.id, payload.bucket, selection.accepted
+    )
+
+    counts = await repo.counts_for(session, rag.id)
+    return FromBucketOut(
+        rag_id=rag.id,
+        name=rag.name,
+        status=counts.status,
+        accepted_documents=accepted,
+        rejected_documents=[
+            RejectedDocument(source_key=r.source_key, reason=r.reason)
+            for r in selection.rejected
+        ],
+    )
 
 
 @router.get("", response_model=list[RagOut])
@@ -301,6 +443,62 @@ async def upload_documents(
     return UploadAccepted(documents=accepted)
 
 
+@router.post(
+    "/{rag_id}/documents/from-bucket",
+    response_model=DocumentsFromBucketOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def add_documents_from_bucket(
+    rag_id: uuid.UUID,
+    payload: DocumentsFromBucketIn,
+    user_id: uuid.UUID = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> DocumentsFromBucketOut:
+    """Добавить в существующий набор файлы, уже лежащие в хранилище."""
+    await _owned(session, rag_id, user_id)
+
+    storage = ObjectStorage()
+    if not storage.bucket_exists(payload.bucket):
+        raise HTTPException(
+            status_code=404, detail=f"Бакет {payload.bucket} не найден")
+
+    objects, missing = _collect(storage, payload)
+    if not objects and not missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"По запросу в {payload.bucket} нет объектов",
+        )
+
+    selection = select(payload.bucket, objects, payload.extensions)
+    selection = Selection(
+        accepted=selection.accepted, rejected=selection.rejected + missing
+    )
+    selection = drop_known(
+        payload.bucket, selection, await repo.existing_hashes(session, rag_id)
+    )
+
+    used = await repo.total_bytes(session, rag_id)
+    fitting, oversized = [], []
+    for obj in selection.accepted:
+        used += obj.size
+        if used > settings.rag_max_bytes_per_set:
+            oversized.append(Rejected(obj.key, "превышен размер набора"))
+        else:
+            fitting.append(obj)
+
+    accepted = await _register_remote(session, rag_id, payload.bucket, fitting)
+    counts = await repo.counts_for(session, rag_id)
+    return DocumentsFromBucketOut(
+        rag_id=rag_id,
+        status=counts.status,
+        accepted_documents=accepted,
+        rejected_documents=[
+            RejectedDocument(source_key=r.source_key, reason=r.reason)
+            for r in selection.rejected + oversized
+        ],
+    )
+
+
 @router.get("/{rag_id}/documents", response_model=list[DocumentOut])
 async def list_documents(
     rag_id: uuid.UUID,
@@ -323,10 +521,12 @@ async def delete_document(
     if document is None:
         raise HTTPException(status_code=404, detail="Документ не найден")
     storage_key = document.storage_key
+    source_bucket = document.source_bucket
     await session.delete(document)
     await session.commit()
     maintenance_queue().enqueue(
-        purge_document, str(rag_id), str(document_id), storage_key
+        purge_document, str(rag_id), str(
+            document_id), storage_key, source_bucket
     )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
