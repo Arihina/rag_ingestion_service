@@ -348,7 +348,7 @@ docling, а не на нашей стороне.
 | `INGEST_DOCLING_URL` | `http://localhost:5001` | |
 | `INGEST_OPENSEARCH_URL` | `http://localhost:9200` | |
 | `INGEST_INDEX_NAME` | `kb-v2` | |
-| `INGEST_DATABASE_URL` | `postgresql+asyncpg://rag:rag@localhost:5432/rag_ingest` | |
+| `INGEST_DATABASE_URL` | `postgresql+asyncpg://rag:rag@localhost:5437/rag_ingest` | |
 | `INGEST_REDIS_URL` | `redis://localhost:6379/1` | база 1: на нулевой очередь docling |
 | `INGEST_S3_ENDPOINT_URL` | `http://localhost:8333` | S3-шлюз SeaweedFS |
 | `INGEST_S3_BUCKET_DOCS` / `_ICONS` / `_STAGING` | `rag-docs` / `rag-icons` / `rag-staging` | |
@@ -427,6 +427,8 @@ curl -X POST localhost:8011/v1/platform/rags \
 POST   /v1/platform/rags/{id}/documents              multipart, N файлов -> 202
 GET    /v1/platform/rags/{id}/documents
 DELETE /v1/platform/rags/{id}/documents/{doc_id}
+POST   /v1/platform/rags/from-bucket                   из чужого бакета -> 202
+POST   /v1/platform/rags/{id}/documents/from-bucket   из бакета в набор -> 202
 POST   /v1/platform/rags/{id}/imports/archive        multipart zip -> 202
 GET    /v1/platform/rags/{id}/imports/{batch_id}
 ```
@@ -445,6 +447,67 @@ curl -X POST localhost:8011/v1/platform/rags/$RAG/documents \
 
 `duplicate_of` заполнен, если такой контент в наборе уже есть: возвращается
 существующий документ, новый не создаётся.
+
+### Создание набора из бакета
+
+```bash
+curl -X POST localhost:8011/v1/platform/rags/from-bucket \
+  -H "Content-Type: application/json" -H "X-User-Id: $U" \
+  -d '{"name":"HR documents 2024","bucket":"knowledge","prefix":"hr-2024/",
+       "recursive":true,"extensions":[".pdf",".docx",".txt"]}'
+```
+
+```json
+{"rag_id": "...", "name": "HR documents 2024", "status": "ingesting",
+ "accepted_documents": [{"document_id": "...", "source_key": "hr-2024/policy.pdf"}],
+ "rejected_documents": [{"source_key": "hr-2024/photo.jpg",
+                         "reason": "расширение .jpg не поддерживается"}]}
+```
+
+Файлы **не копируются**: в `documents` пишется ссылка
+(`source_bucket` + `storage_key`), воркер читает оттуда же. Отсюда два
+следствия, заложенных в остальной код:
+
+- удаление набора или документа **не трогает** чужие объекты — мы их туда
+  не клали;
+- жизненный цикл исходников вне нашего контроля: если владелец бакета
+  удалит файл, переиндексация упрётся в его отсутствие.
+
+Отбор идёт **по листингу, без чтения содержимого**: размер и имя берутся
+из метаданных S3, поэтому слишком большой файл отсеивается до того, как
+байты пойдут по сети. Отклонение отдельного объекта не валит импорт —
+чужой бакет закономерно содержит посторонние файлы.
+
+Дедупликация внутри импорта работает по ETag: два одинаковых файла под
+разными именами дадут один документ. Против файлов, залитых обычным
+upload, она не работает — у тех хэш считается по содержимому, а его мы
+здесь не читаем.
+
+Прогресс — обычным `GET /v1/platform/rags/{id}`.
+
+### Добавление в существующий набор
+
+Два взаимоисключающих режима — явный список либо префикс:
+
+```bash
+curl -X POST localhost:8011/v1/platform/rags/$RAG/documents/from-bucket \
+  -H "Content-Type: application/json" -H "X-User-Id: $U" \
+  -d '{"bucket":"knowledge","keys":["hr-2024/new-policy.pdf","hr-2024/addendum.pdf"]}'
+
+curl -X POST localhost:8011/v1/platform/rags/$RAG/documents/from-bucket \
+  -H "Content-Type: application/json" -H "X-User-Id: $U" \
+  -d '{"bucket":"knowledge","prefix":"hr-2024/","recursive":true}'
+```
+
+Второй режим **повторяем**: всё, что уже импортировано, уходит в
+`rejected_documents` с пометкой «уже в наборе», а новые файлы забираются.
+Это и есть инкрементальный импорт — вызывай сколько угодно раз по мере
+пополнения бакета.
+
+Явные ключи требуют HEAD-запроса на каждый, потому что листинг для
+произвольных ключей бесполезен: общего префикса у них может не быть.
+Отсутствующий объект попадает в `rejected`, а не роняет запрос — часть
+списка могла устареть.
 
 ### Внутренняя ручка для agentic_rag
 
@@ -533,7 +596,8 @@ rag_sets
 documents
   id, rag_id, filename, size_bytes, content_hash
   storage_key                                     -- ключ в SeaweedFS
-  origin (upload|archive|s3), origin_ref
+  origin (upload|archive|s3|bucket), origin_ref
+  source_bucket                                   -- NULL = наш бакет
   status (pending|processing|success|failed), error, chunks_count
   -- unique (rag_id, content_hash)
 

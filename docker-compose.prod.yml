@@ -78,9 +78,13 @@ services:
       timeout: 3s
       retries: 5
 
+  # Порт 5437 — тот же, что в деве: наружу здесь ничего не публикуется и
+  # конфликта нет, но единое число избавляет от правки строки подключения
+  # при переносе конфигурации между окружениями.
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    command: ["postgres", "-p", "5437"]
     environment:
       POSTGRES_USER: rag
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
@@ -88,9 +92,9 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     expose:
-      - "5432"
+      - "5437"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rag -d rag_ingest"]
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag_ingest -p 5437"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -181,7 +185,7 @@ services:
       INGEST_OPENSEARCH_URL: https://opensearch:9200
       INGEST_OPENSEARCH_USER: admin
       INGEST_OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD}
-      INGEST_DATABASE_URL: postgresql+asyncpg://rag:${POSTGRES_PASSWORD}@postgres:5432/rag_ingest
+      INGEST_DATABASE_URL: postgresql+asyncpg://rag:${POSTGRES_PASSWORD}@postgres:5437/rag_ingest
       INGEST_REDIS_URL: redis://redis:6379/1
       INGEST_S3_ENDPOINT_URL: http://seaweedfs:8333
       INGEST_S3_PRESIGN_ENDPOINT_URL: http://seaweedfs:8333
@@ -220,7 +224,7 @@ services:
       INGEST_OPENSEARCH_URL: https://opensearch:9200
       INGEST_OPENSEARCH_USER: admin
       INGEST_OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD}
-      INGEST_DATABASE_URL: postgresql+asyncpg://rag:${POSTGRES_PASSWORD}@postgres:5432/rag_ingest
+      INGEST_DATABASE_URL: postgresql+asyncpg://rag:${POSTGRES_PASSWORD}@postgres:5437/rag_ingest
       INGEST_REDIS_URL: redis://redis:6379/1
       INGEST_RQ_QUEUE_INGEST: ingest
       INGEST_RQ_QUEUE_MAINTENANCE: maintenance
