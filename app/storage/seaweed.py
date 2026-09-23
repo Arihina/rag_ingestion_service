@@ -24,6 +24,24 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class RemoteObject:
+    """Объект в чужом бакете, который НЕ загружали."""
+
+    key: str
+    size: int
+    etag: str
+
+    @property
+    def filename(self) -> str:
+        return self.key.rsplit("/", 1)[-1]
+
+    @property
+    def suffix(self) -> str:
+        name = self.filename
+        return "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+@dataclass(frozen=True)
 class StoredObject:
     key: str
     size_bytes: int
@@ -107,6 +125,58 @@ class ObjectStorage:
         for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
             out.extend(page.get("Contents", []))
         return out
+
+    def head_object(self, bucket: str, key: str) -> RemoteObject | None:
+        """Метаданные одного ключа без чтения содержимого.
+        Нужен для импорта по явному списку.
+        """
+        try:
+            head = self._client.head_object(Bucket=bucket, Key=key)
+        except ClientError:
+            return None
+        return RemoteObject(
+            key=key,
+            size=head["ContentLength"],
+            etag=str(head.get("ETag", "")).strip('"'),
+        )
+
+    def bucket_exists(self, bucket: str) -> bool:
+        try:
+            self._client.head_bucket(Bucket=bucket)
+            return True
+        except ClientError:
+            return False
+
+    def list_objects(
+        self, bucket: str, prefix: str, *, recursive: bool = True, limit: int = 10_000
+    ) -> list[RemoteObject]:
+        """Обзор префикса без чтения содержимого.
+        recursive=False ставит Delimiter="/": объекты глубже одного уровня
+        уходят в CommonPrefixes и в выдачу не попадают.
+        limit жёсткий: страницы перестают запрашиваться, как только он набран.
+        """
+        paginator = self._client.get_paginator("list_objects_v2")
+        params: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+        if not recursive:
+            params["Delimiter"] = "/"
+
+        objects: list[RemoteObject] = []
+        for page in paginator.paginate(**params):
+            for item in page.get("Contents", []):
+                key = item["Key"]
+
+                if key.endswith("/"):
+                    continue
+                objects.append(
+                    RemoteObject(
+                        key=key,
+                        size=item["Size"],
+                        etag=str(item.get("ETag", "")).strip('"'),
+                    )
+                )
+                if len(objects) >= limit:
+                    return objects
+        return objects
 
     def delete(self, bucket: str, key: str) -> None:
         self._client.delete_object(Bucket=bucket, Key=key)

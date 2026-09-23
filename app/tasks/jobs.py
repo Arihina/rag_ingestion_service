@@ -71,6 +71,7 @@ async def _ingest_document(document_id: uuid.UUID) -> int:
                 return 0
             rag_id = str(document.rag_id)
             storage_key = document.storage_key
+            source_bucket = document.source_bucket or settings.s3_bucket_docs
             document.status = "processing"
             await session.execute(
                 update(IngestJob)
@@ -80,15 +81,13 @@ async def _ingest_document(document_id: uuid.UUID) -> int:
 
         use_upload = settings.docling_transfer == "upload"
         if use_upload:
-            payload, _ = storage.get_bytes(
-                settings.s3_bucket_docs, storage_key)
+            payload, _ = storage.get_bytes(source_bucket, storage_key)
             tmp = Path(tempfile.mkdtemp()) / Path(storage_key).name
             tmp.write_bytes(payload)
             source: object = tmp
             client_cls: type = DoclingFileClient
         else:
-            source = storage.presigned_get(
-                settings.s3_bucket_docs, storage_key)
+            source = storage.presigned_get(source_bucket, storage_key)
             client_cls = DoclingUrlClient
 
         async with client_cls(
@@ -382,17 +381,29 @@ async def _purge_rag(rag_id: uuid.UUID) -> int:
         await dispose()
 
 
-def purge_document(rag_id: str, document_id: str, storage_key: str) -> int:
-    return asyncio.run(_purge_document(rag_id, document_id, storage_key))
+def purge_document(
+    rag_id: str, document_id: str, storage_key: str, source_bucket: str | None = None
+) -> int:
+    return asyncio.run(
+        _purge_document(rag_id, document_id, storage_key, source_bucket)
+    )
 
 
-async def _purge_document(rag_id: str, document_id: str, storage_key: str) -> int:
+async def _purge_document(
+    rag_id: str, document_id: str, storage_key: str, source_bucket: str | None
+) -> int:
     storage = ObjectStorage()
     os_client = _opensearch()
     loader = OpenSearchLoader(os_client, settings.index_name)
     try:
         deleted = await loader.delete_document(rag_id, document_id)
-        storage.delete(settings.s3_bucket_docs, storage_key)
+        if source_bucket is None:
+            storage.delete(settings.s3_bucket_docs, storage_key)
+        else:
+            logger.info(
+                "Документ %s ссылался на %s/%s — исходник не трогаем",
+                document_id, source_bucket, storage_key,
+            )
         return deleted
     finally:
         await os_client.close()
