@@ -10,7 +10,7 @@ top_k x 3 ветки x N вариантов multi-query x итерации, и �
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config import settings
 
@@ -138,3 +138,68 @@ class DocumentEntry(BaseModel):
 
 class DocumentLookupOut(BaseModel):
     documents: list[DocumentEntry]
+
+
+class RagFromBucketIn(RagCreate):
+    """Создание набора из уже лежащих в хранилище файлов."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bucket: str = Field(min_length=1, max_length=255)
+    prefix: str = Field(default="", max_length=1024)
+    recursive: bool = True
+    extensions: list[str] = Field(default_factory=list, max_length=32)
+
+
+class AcceptedDocument(BaseModel):
+    document_id: uuid.UUID
+    source_key: str
+
+
+class RejectedDocument(BaseModel):
+    source_key: str
+    reason: str
+
+
+class FromBucketOut(BaseModel):
+    rag_id: uuid.UUID
+    name: str
+    status: str
+    accepted_documents: list[AcceptedDocument]
+    rejected_documents: list[RejectedDocument]
+
+
+class DocumentsFromBucketIn(BaseModel):
+    """Добавление файлов из хранилища в существующий набор.
+
+    Два взаимоисключающих режима:
+
+      * keys — явный список объектов. Метаданные берутся HEAD-запросом на
+        каждый, потому что листинг для произвольных ключей бесполезен.
+      * prefix — пересканировать префикс. Осмысленно именно здесь:
+        дедупликация идёт против уже лежащих в наборе документов, так что
+        повторный вызов заберёт только новое.
+
+    Ровно один из них, иначе непонятно, что делать с пересечением.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bucket: str = Field(min_length=1, max_length=255)
+    keys: list[str] = Field(default_factory=list, max_length=500)
+    prefix: str | None = Field(default=None, max_length=1024)
+    recursive: bool = True
+    extensions: list[str] = Field(default_factory=list, max_length=32)
+
+    @model_validator(mode="after")
+    def _exactly_one_mode(self) -> "DocumentsFromBucketIn":
+        if bool(self.keys) == (self.prefix is not None):
+            raise ValueError("нужен ровно один из keys или prefix")
+        return self
+
+
+class DocumentsFromBucketOut(BaseModel):
+    rag_id: uuid.UUID
+    status: str
+    accepted_documents: list[AcceptedDocument]
+    rejected_documents: list[RejectedDocument]
