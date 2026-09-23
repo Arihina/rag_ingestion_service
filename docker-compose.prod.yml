@@ -15,16 +15,25 @@ x-docling-common: &docling-common
   image: ${DOCLING_IMAGE:?set DOCLING_IMAGE, e.g. registry.internal/docling-serve@sha256:...}
   restart: unless-stopped
   environment: &docling-env
-    DOCLING_SERVE_ARTIFACTS_PATH: /opt/app-root/src/models
+    # Том, а не каталог внутри образа: официальный образ docling-serve
+    # весов не содержит, а HF_HUB_OFFLINE ниже запрещает их докачивать.
+    # Наполняет том docling-models-init — тем же скриптом, что в dev и test.
+    DOCLING_SERVE_ARTIFACTS_PATH: /models/docling
+    HF_HOME: /models/hf
+    HOME: /models/home
     DOCLING_DEVICE: cuda:0
     DOCLING_NUM_THREADS: "8"
     DOCLING_SERVE_ENG_KIND: rq
     DOCLING_SERVE_ENG_RQ_REDIS_URL: redis://redis:6379/0
     # Жёсткая гарантия, что в рантайме ничего не полезет в сеть.
     HF_HUB_OFFLINE: "1"
+  volumes:
+    - models:/models:ro
   depends_on:
     redis:
       condition: service_healthy
+    docling-models-init:
+      condition: service_completed_successfully
   deploy:
     resources:
       reservations:
@@ -141,6 +150,26 @@ services:
       retries: 10
       start_period: 20s
 
+  # Одноразовый: наполняет том моделей и завершается. Раньше это была
+  # команда в docs/deploy-prod.md, которую надо было не забыть запустить
+  # руками, — и она успела разойтись с девовской: в ней потерялся шаг с
+  # русской моделью EasyOCR, то есть русский OCR на сканах не работал бы.
+  #
+  # WITH_EMBEDDINGS=1: здесь api живёт в контейнере и берёт веса bge-m3
+  # из этого же тома.
+  docling-models-init:
+    image: ${DOCLING_IMAGE:?set DOCLING_IMAGE}
+    user: "0"
+    environment:
+      MODELS_DIR: /models
+      OCR_LANGS: "${OCR_LANGS:-ru en}"
+      WITH_EMBEDDINGS: "1"
+    entrypoint: ["/bin/bash", "/opt/download-models.sh"]
+    volumes:
+      - models:/models
+      - ./deploy/download-models.sh:/opt/download-models.sh:ro
+    restart: "no"
+
   docling-api:
     <<: *docling-common
     environment:
@@ -182,6 +211,11 @@ services:
       INGEST_INTERNAL_HOST: 0.0.0.0
       INGEST_DOCLING_URL: http://docling-api:5001
       INGEST_DOCLING_API_KEY: ${DOCLING_KEY}
+      # upload, а не url: docling режет presigned-ссылки на приватные
+      # адреса своим allowlist для http_sources ("URL is not allowed").
+      # Prod не читает ingest.env, поэтому дефолт "url" из config.py
+      # сломал бы здесь каждую задачу индексации.
+      INGEST_DOCLING_TRANSFER: upload
       INGEST_OPENSEARCH_URL: https://opensearch:9200
       INGEST_OPENSEARCH_USER: admin
       INGEST_OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD}
@@ -205,6 +239,9 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
       seaweedfs: { condition: service_healthy }
+      # Веса bge-m3 берутся из тома, а HF_HUB_OFFLINE выше запрещает
+      # докачку — стартовать до наполнения тома нельзя.
+      docling-models-init: { condition: service_completed_successfully }
     deploy:
       resources:
         reservations:
@@ -221,6 +258,11 @@ services:
     environment:
       INGEST_DOCLING_URL: http://docling-api:5001
       INGEST_DOCLING_API_KEY: ${DOCLING_KEY}
+      # upload, а не url: docling режет presigned-ссылки на приватные
+      # адреса своим allowlist для http_sources ("URL is not allowed").
+      # Prod не читает ingest.env, поэтому дефолт "url" из config.py
+      # сломал бы здесь каждую задачу индексации.
+      INGEST_DOCLING_TRANSFER: upload
       INGEST_OPENSEARCH_URL: https://opensearch:9200
       INGEST_OPENSEARCH_USER: admin
       INGEST_OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD}

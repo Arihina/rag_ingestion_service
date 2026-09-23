@@ -1,0 +1,218 @@
+# Тестовый сервер: зависимости в контейнерах, сервис и воркер — с хоста.
+#
+# Запуск: docker compose -f docker-compose.test.yml up -d
+#
+# Отличия от dev:
+#   * том моделей — именованный, а не папка на хосте: на сервере некому
+#     готовить каталог руками и следить за правами;
+#   * restart: unless-stopped — стенд переживает перезагрузку машины;
+#   * адрес публикации портов настраивается через BIND_ADDR.
+#
+# Отличия от prod:
+#   * никакого TLS, сертификатов и обязательных паролей — стенд стоит
+#     во внутренней сети;
+#   * docling работает в режиме local, без Redis-очереди и отдельных
+#     воркеров конверсии;
+#   * api и worker НЕ контейнеризованы: запускаются в venv на хосте,
+#     как в деве, — стенд нужен для проверки кода, а не образов.
+#
+# Перед первым запуском:
+#   cp ingest.env.example ingest.env
+#   docker compose -f docker-compose.test.yml up -d
+#   alembic upgrade head
+#   python -m app.main
+#   rq worker -u redis://localhost:6379/1 ingest maintenance
+
+x-docling-image: &docling-image ghcr.io/docling-project/docling-serve-cu128:v1.21.0
+
+# Порты зависимостей публикуются на ${BIND_ADDR}, по умолчанию 127.0.0.1:
+# api и worker живут на этой же машине, и выставлять Postgres с OpenSearch
+# в сеть незачем. Снаружи стенд виден только через порт самого сервиса
+# (INGEST_HOST в ingest.env).
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:3.5.0
+    container_name: opensearch-rag-test
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=Opensearch1!
+      - bootstrap.memory_lock=true
+      # Половина от mem_limit ниже. Поднимать выше ~31g нельзя: JVM
+      # теряет сжатые указатели, и heap начинает работать хуже.
+      - "OPENSEARCH_JAVA_OPTS=-Xms${OPENSEARCH_HEAP:-4g} -Xmx${OPENSEARCH_HEAP:-4g}"
+      # HNSW-графы живут ВНЕ heap: лимит отдельный, считается от памяти
+      # контейнера — отсюда mem_limit ниже.
+      - knn.memory.circuit_breaker.limit=60%
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    mem_limit: ${OPENSEARCH_MEM_LIMIT:-12g}
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:9200:9200"
+      - "${BIND_ADDR:-127.0.0.1}:9600:9600"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # Смотреть индекс глазами на стенде полезнее, чем в проде. Если память
+  # дороже — `docker compose -f docker-compose.test.yml stop dashboards`.
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:3.5.0
+    container_name: opensearch-dashboards-test
+    restart: unless-stopped
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:5601:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  # Порт 5437, а не штатный 5432: тот бывает занят другим экземпляром
+  # Postgres на машине. Меняется порт самого демона, а не только
+  # публикация, чтобы адрес был одинаковым и с хоста, и из сети compose.
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-rag-test
+    restart: unless-stopped
+    command: [ "postgres", "-p", "5437" ]
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag}
+      POSTGRES_DB: rag_ingest
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:5437:5437"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -U обязателен: без него pg_isready проверяется под пользователем
+      # postgres, которого в этом образе с заданным POSTGRES_USER нет,
+      # и healthcheck зелёный при неготовой базе.
+      test: [ "CMD-SHELL", "pg_isready -U rag -d rag_ingest -p 5437" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-rag-test
+    restart: unless-stopped
+    # appendonly: очередь RQ переживает рестарт контейнера. Без него
+    # задачи, поставленные за последнюю минуту, теряются молча, а
+    # документы навсегда остаются в pending.
+    command: [ "redis-server", "--appendonly", "yes" ]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # Одна нода: master, volume, filer и S3-шлюз в одном процессе.
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.98
+    container_name: seaweedfs-rag-test
+    restart: unless-stopped
+    command:
+      - server
+      - -dir=/data
+      - -master.volumeSizeLimitMB=5000
+      - -volume.max=200
+      - -filer
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/seaweedfs-s3.json
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:8333:8333"
+      - "${BIND_ADDR:-127.0.0.1}:9333:9333"
+      - "${BIND_ADDR:-127.0.0.1}:8888:8888"
+    volumes:
+      - seaweedfs-data:/data
+      # Каталог, а не файл: при bind-mount отсутствующего файла Docker
+      # молча создаёт на его месте пустой КАТАЛОГ, и weed падает с
+      # "is a directory" уже после того, как master и filer поднялись.
+      - ./deploy:/etc/seaweedfs:ro
+    healthcheck:
+      # 127.0.0.1, а не localhost: /etc/hosts в alpine резолвит localhost
+      # в ::1, а weed слушает только IPv4 — проверка не достучится до
+      # работающего сервиса и повесит всё, что ждёт service_healthy.
+      test: [ "CMD-SHELL", "wget -q --spider http://127.0.0.1:9333/cluster/status || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # Одноразовый: наполняет том моделей и завершается. docling стартует
+  # только после его успешного выхода.
+  #
+  # WITH_EMBEDDINGS не выставлен: api здесь работает на хосте в venv и
+  # держит веса bge-m3 в своём кэше HuggingFace. Тащить 2.3 ГБ ещё и
+  # сюда незачем — в томе нужен только токенизатор для чанкера.
+  docling-models-init:
+    image: *docling-image
+    container_name: docling-models-init-test
+    user: "0"
+    environment:
+      MODELS_DIR: /models
+      OCR_LANGS: "ru en"
+    entrypoint: [ "/bin/bash", "/opt/download-models.sh" ]
+    volumes:
+      - docling-models:/models
+      - ./deploy/download-models.sh:/opt/download-models.sh:ro
+    restart: "no"
+
+  docling:
+    image: *docling-image
+    container_name: docling-serve-test
+    restart: unless-stopped
+    environment:
+      DOCLING_SERVE_ARTIFACTS_PATH: /models/docling
+      HF_HOME: /models/hf
+      HOME: /models/home
+      # Стенд без карты: DOCLING_DEVICE=cpu и убрать блок deploy ниже.
+      DOCLING_DEVICE: ${DOCLING_DEVICE:-cuda:0}
+      DOCLING_NUM_THREADS: "${DOCLING_NUM_THREADS:-4}"
+      # UI оставлен: на стенде удобно закинуть проблемный PDF руками и
+      # посмотреть, что вернули layout и OCR, не гоняя пайплайн целиком.
+      DOCLING_SERVE_ENABLE_UI: "true"
+      DOCLING_SERVE_ENG_KIND: local
+      # Веса на месте — запрещаем рантайму ходить в сеть.
+      HF_HUB_OFFLINE: "1"
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:5001:5001"
+    volumes:
+      - docling-models:/models
+    depends_on:
+      docling-models-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1" ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+
+volumes:
+  opensearch-data:
+  postgres-data:
+  redis-data:
+  seaweedfs-data:
+  docling-models:

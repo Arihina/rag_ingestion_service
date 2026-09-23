@@ -153,39 +153,30 @@ services:
   # Русскую модель EasyOCR тянем отдельно: docling отключает докачку весов
   # в рантайме, когда задан artifacts_path (считает это офлайн-режимом),
   # а docling-tools кладёт только детектор и латиницу.
+  # Одноразовый: наполняет /models и завершается.
+  #
+  # Состав моделей и порядок шагов — в deploy/download-models.sh, общем
+  # для dev, test и prod. Раньше команда жила прямо здесь и в
+  # docs/deploy-prod.md, и версии успели разъехаться: в проде потерялся
+  # шаг с русской моделью EasyOCR.
+  #
+  # WITH_EMBEDDINGS=0 по умолчанию: в основном режиме дева api работает
+  # с хоста в venv и держит веса bge-m3 в своём кэше HuggingFace, так
+  # что 2.3 ГБ в этом томе были бы второй копией. Поднимаешь профиль
+  # app (api в контейнере) — WITH_EMBEDDINGS=1 up -d, иначе api упадёт
+  # на старте: у него HF_HUB_OFFLINE и модели взять неоткуда.
   docling-models-init:
     image: *docling-image
     container_name: docling-models-init
     user: "0"
     environment:
-      HF_HOME: /models/hf
-      HOME: /models/home
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        set -eux
-        mkdir -p /models/docling /models/hf /models/home
-        docling-tools models download -o /models/docling \
-          layout tableformer easyocr rapidocr
-        python - <<'PY'
-        import easyocr
-        easyocr.Reader(
-            ["ru", "en"],
-            model_storage_directory="/models/docling/EasyOcr",
-            download_enabled=True,
-            gpu=False,
-        )
-        PY
-        # Не только токенизатор для чанкера, но и веса целиком: их же
-        # использует процесс API, монтируя этот том. Иначе первый старт
-        # сервиса потянул бы 2.3 ГБ из сети мимо всякого офлайн-режима.
-        python -c "from huggingface_hub import snapshot_download; snapshot_download('BAAI/bge-m3')"
-        chown -R 1001:0 /models
-        echo "=== ИТОГ ==="
-        du -sh /models/*
-        ls -la /models/docling/EasyOcr || true
+      MODELS_DIR: /models
+      OCR_LANGS: "ru en"
+      WITH_EMBEDDINGS: "${WITH_EMBEDDINGS:-0}"
+    entrypoint: ["/bin/bash", "/opt/download-models.sh"]
     volumes:
       - /home/dodo/storage/docling-models:/models
+      - ./deploy/download-models.sh:/opt/download-models.sh:ro
     restart: "no"
 
   docling:
