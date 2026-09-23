@@ -95,7 +95,7 @@ class ImportBatch(Base):
         PgUUID(as_uuid=True), ForeignKey("rag_sets.id", ondelete="CASCADE"), nullable=False
     )
     kind: Mapped[str] = mapped_column(
-        String(16), nullable=False)  # archive | s3
+        String(16), nullable=False)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=text("'pending'"))
 
@@ -130,6 +130,7 @@ class Document(Base):
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    source_bucket: Mapped[str | None] = mapped_column(String(255))
 
     origin: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default=text("'upload'"))
@@ -153,15 +154,15 @@ class Document(Base):
     rag_set: Mapped[RagSet] = relationship(back_populates="documents")
 
     __table_args__ = (
-        # Дедупликация повторной загрузки
         UniqueConstraint("rag_id", "content_hash",
                          name="uq_documents_rag_hash"),
         Index("ix_documents_rag_status", "rag_id", "status"),
         CheckConstraint(
             "status IN ('pending','processing','success','failed')", name="ck_document_status"
         ),
-        CheckConstraint("origin IN ('upload','archive','s3')",
-                        name="ck_document_origin"),
+        CheckConstraint(
+            "origin IN ('upload','archive','s3','bucket')", name="ck_document_origin"
+        ),
     )
 
 

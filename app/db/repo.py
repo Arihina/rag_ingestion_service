@@ -243,3 +243,14 @@ async def documents_by_ids(
             )
         ).scalars()
     )
+
+
+async def existing_hashes(session: AsyncSession, rag_id: uuid.UUID) -> set[str]:
+    """Хэши документов, уже лежащих в наборе."""
+    return set(
+        (
+            await session.execute(
+                select(Document.content_hash).where(Document.rag_id == rag_id)
+            )
+        ).scalars()
+    )
