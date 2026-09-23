@@ -104,7 +104,7 @@ pip install -r requirements.txt -r requirements-embed.txt
 ```bash
 alembic revision --autogenerate -m "control plane"
 alembic upgrade head
-psql postgresql://rag:rag@localhost:5432/rag_ingest -c '\dt'
+psql postgresql://rag:rag@localhost:5437/rag_ingest -c '\dt'
 ```
 
 Ожидаются пять таблиц: `rag_sets`, `documents`, `import_batches`,
@@ -153,7 +153,10 @@ curl -s localhost:8011/health | jq
 Проверить саму сборку или воспроизвести прод:
 
 ```bash
-docker compose -f docker-compose.dev.yml --profile app up -d --build
+# WITH_EMBEDDINGS=1 обязателен: в контейнере api берёт веса bge-m3 из
+# тома моделей, а по умолчанию туда кладётся только токенизатор —
+# в основном режиме дева веса живут в хостовом кэше HuggingFace.
+WITH_EMBEDDINGS=1 docker compose -f docker-compose.dev.yml --profile app up -d --build
 docker compose -f docker-compose.dev.yml exec api alembic upgrade head
 ```
 

@@ -71,23 +71,33 @@ Compose объявляет их через `${VAR:?required}`, поэтому о
 
 ## 3. Веса моделей
 
-Том `models` должен быть наполнен до старта `api`: в проде включён
-`HF_HUB_OFFLINE=1`, и рантайм в сеть не полезет.
+Наполняются автоматически: сервис `docling-models-init` отрабатывает до
+старта `docling-api` и `api`, оба ждут его через
+`depends_on: service_completed_successfully`. Руками ничего запускать не
+нужно.
+
+Состав — в `deploy/download-models.sh`, общем для dev, test и prod:
+`layout`, `tableformer`, `easyocr` с русской моделью, `rapidocr` и
+bge-m3 (токенизатор плюс веса, `WITH_EMBEDDINGS=1` — здесь `api` живёт
+в контейнере и берёт их из этого же тома).
+
+Ничего сверх этого не тянется: VLM-модели (`granitedocling`,
+`smoldocling`, `granite_vision`), распознавание формул и классификатор
+картинок к задаче отношения не имеют и весят на порядок больше самого
+пайплайна. Подробнее про состав — в [`deploy-test.md`](deploy-test.md).
+
+`rapidocr` в списке, хотя рабочий движок — EasyOCR: docling-serve на
+старте прогревает пайплайн с дефолтными опциями, а дефолтный движок
+выбирает RapidOCR. Без его весов контейнер падает с `FileNotFoundError`
+ещё до первого запроса.
+
+Пересобрать том с нуля:
 
 ```bash
-docker compose -f docker-compose.prod.yml run --rm \
-  -v rag_ingestion_service_models:/models \
-  --entrypoint bash docling-api -c '
-    export HF_HOME=/models/hf
-    docling-tools models download -o /models/docling layout tableformer easyocr rapidocr
-    python -c "from huggingface_hub import snapshot_download; snapshot_download(\"BAAI/bge-m3\")"
-  '
+docker compose -f docker-compose.prod.yml down
+docker volume rm rag_ingestion_service_models
+docker compose -f docker-compose.prod.yml up -d
 ```
-
-`rapidocr` обязателен, даже если рабочий движок — EasyOCR: docling-serve
-на старте прогревает пайплайн с дефолтными опциями, а дефолтный движок —
-`auto`, который выбирает RapidOCR. Без этих весов контейнер падает с
-`FileNotFoundError` ещё до первого запроса.
 
 ---
 

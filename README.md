@@ -19,6 +19,7 @@
 Пошаговые инструкции вынесены отдельно:
 
 - [`docs/deploy-dev.md`](docs/deploy-dev.md) — зависимости в Docker, сервис с хоста
+- [`docs/deploy-test.md`](docs/deploy-test.md) — тестовый сервер: зависимости в контейнерах, сервис с хоста
 - [`docs/deploy-prod.md`](docs/deploy-prod.md) — всё в контейнерах, образы из реестра
 - [`docs/testing.md`](docs/testing.md) — юнит-тесты и ручной интеграционный прогон
 - [`docs/ports.md`](docs/ports.md) — разведение портов и что оно защищает
@@ -175,12 +176,15 @@ Dockerfile               две цели: api и worker
 requirements.txt         общее для обеих ролей
 requirements-embed.txt   torch + FlagEmbedding, только для api
 ingest.env.example
-docker-compose.dev.yml
-docker-compose.prod.yml
+deploy/download-models.sh       состав моделей docling, общий для всех сред
+
+docker-compose.dev.yml          дев: зависимости + профиль app под контейнеры
+docker-compose.test.yml         стенд: зависимости, сервис и воркер с хоста
+docker-compose.prod.yml         прод: всё в контейнерах, образы из реестра
 docker-compose.opensearch.yml   только OpenSearch, если docling живёт отдельно
 ```
 
-Каталог назван `app/tasks/`, а не `app/tasks/`, потому что `queue` есть в
+Каталог назван `app/tasks/`, а не `app/queue/`, потому что `queue` есть в
 стандартной библиотеке: затенения при абсолютных импортах не будет, но читать
 такой импорт неприятно, а рано или поздно кто-то напишет относительный.
 
