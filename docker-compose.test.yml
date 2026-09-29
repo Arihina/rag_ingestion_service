@@ -190,14 +190,14 @@ services:
       # Веса на месте — запрещаем рантайму ходить в сеть.
       HF_HUB_OFFLINE: "1"
     ports:
-      - "${BIND_ADDR:-127.0.0.1}:5001:5001"
+      - "${BIND_ADDR:-127.0.0.1}:5002:5001"
     volumes:
       - docling-models:/models
     depends_on:
       docling-models-init:
         condition: service_completed_successfully
     healthcheck:
-      test: [ "CMD-SHELL", "curl -sf http://localhost:5001/health || exit 1" ]
+      test: [ "CMD-SHELL", "curl -sf http://localhost:5002/health || exit 1" ]
       interval: 30s
       timeout: 5s
       retries: 5

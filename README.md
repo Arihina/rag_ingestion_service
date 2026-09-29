@@ -263,7 +263,7 @@ curl -s localhost:8011/health | jq
 ```
 
 Dashboards на <http://localhost:5601>, UI docling на
-<http://localhost:5001/ui> — туда можно закинуть проблемный PDF руками и
+<http://localhost:5002/ui> — туда можно закинуть проблемный PDF руками и
 посмотреть, что вернули layout и OCR, не гоняя пайплайн целиком.
 
 ### Без Docker
@@ -349,7 +349,7 @@ docling, а не на нашей стороне.
 | `INGEST_RELOAD` | `false` | модели перезагружаются на каждую правку |
 | `INGEST_TIMEOUT_KEEP_ALIVE` | `300` | под большие загрузки |
 | `INGEST_SELF_URL` | `http://localhost:8011` | **куда воркер ходит за векторами** |
-| `INGEST_DOCLING_URL` | `http://localhost:5001` | |
+| `INGEST_DOCLING_URL` | `http://localhost:5002` | |
 | `INGEST_OPENSEARCH_URL` | `http://localhost:9200` | |
 | `INGEST_INDEX_NAME` | `kb-v2` | |
 | `INGEST_DATABASE_URL` | `postgresql+asyncpg://rag:rag@localhost:5437/rag_ingest` | |
