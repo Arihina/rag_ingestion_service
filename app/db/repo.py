@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Document, ImportBatch, IngestJob, RagSet
@@ -86,6 +86,42 @@ async def get_rag(
                 RagSet.deleted_at.is_(None),
             )
         )
+    ).scalar_one_or_none()
+
+
+async def get_rag_for_read(
+    session: AsyncSession, rag_id: uuid.UUID, user_id: uuid.UUID
+) -> RagSet | None:
+    """Чтение: владелец или shared/public набор (общий технический корпус).
+
+    Запись через этот вызов открывать нельзя — для неё отдельный
+    `get_rag_for_write` (владелец или админ).
+    """
+    return (
+        await session.execute(
+            select(RagSet).where(
+                RagSet.id == rag_id,
+                RagSet.deleted_at.is_(None),
+                or_(
+                    RagSet.owner_id == user_id,
+                    RagSet.visibility.in_(("shared", "public")),
+                ),
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def get_rag_for_write(
+    session: AsyncSession, rag_id: uuid.UUID, user_id: uuid.UUID, is_admin: bool
+) -> RagSet | None:
+    """Запись: владелец или админ (для системного/общего набора)."""
+    where = [RagSet.id == rag_id, RagSet.deleted_at.is_(None)]
+    if is_admin:
+        pass  # админ может писать в любой живой набор
+    else:
+        where.append(RagSet.owner_id == user_id)
+    return (
+        await session.execute(select(RagSet).where(*where))
     ).scalar_one_or_none()
 
 

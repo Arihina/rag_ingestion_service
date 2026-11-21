@@ -42,6 +42,14 @@ class RagSet(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
 
+    # Технический корпус vs пользовательские наборы (agentic_rag).
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'user'"))
+    visibility: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'private'"))
+    index_name: Mapped[str] = mapped_column(
+        String(128), nullable=False, server_default=text("'kb-v2'"))
+
     prompt: Mapped[str | None] = mapped_column(Text)
     temperature: Mapped[float] = mapped_column(
         Float, nullable=False, server_default=text("0.3"))
@@ -79,6 +87,10 @@ class RagSet(Base):
         CheckConstraint("top_k >= 1 AND top_k <= 10", name="ck_rag_top_k"),
         CheckConstraint(
             "score_threshold >= 0 AND score_threshold <= 1", name="ck_rag_score_threshold"
+        ),
+        CheckConstraint("kind IN ('user','technical')", name="ck_rag_kind"),
+        CheckConstraint(
+            "visibility IN ('private','shared','public')", name="ck_rag_visibility"
         ),
     )
 
