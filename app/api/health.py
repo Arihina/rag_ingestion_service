@@ -1,21 +1,37 @@
 from __future__ import annotations
 
-"""Проверка доступности зависимостей."""
+"""Проверка живости и готовности.
+
+GET /health (liveness) — публичный, без обращения к зависимостям и без
+подробностей о них: это только «процесс жив». Его дёргают и master, и
+оркестратор контейнеров.
+
+GET /health/ready (readiness) — тяжёлая проверка зависимостей; живёт только
+на внутреннем порту и закрыта сервисным токеном (как /embed и /v1/internal).
+"""
 
 import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import text
 
 from app.config import settings
 from app.db import sessionmaker
+from app.deps import require_internal_service
 from app.state import state
 from app.tasks.conn import redis_conn
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["service"])
+ready_router = APIRouter(
+    tags=["service"], dependencies=[Depends(require_internal_service)]
+)
+
+
+class LivenessResponse(BaseModel):
+    status: str
 
 
 class HealthResponse(BaseModel):
@@ -39,8 +55,13 @@ async def _docling_ok() -> bool:
         return False
 
 
-@router.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
+@router.get("/health", response_model=LivenessResponse)
+async def health() -> LivenessResponse:
+    return LivenessResponse(status="ok")
+
+
+@ready_router.get("/health/ready", response_model=HealthResponse)
+async def health_ready() -> HealthResponse:
     docling_ok = await _docling_ok()
 
     try:

@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session, repo
+from app.deps import require_internal_service
 from app.schemas.rags import (
     DocumentEntry,
     DocumentLookupIn,
@@ -21,7 +22,8 @@ from app.schemas.rags import (
 )
 
 router = APIRouter(
-    prefix="/v1/internal", tags=["internal"]
+    prefix="/v1/internal", tags=["internal"],
+    dependencies=[Depends(require_internal_service)],
 )
 
 
@@ -31,8 +33,12 @@ async def internal_rag(
     user_id: uuid.UUID = Query(...),
     session: AsyncSession = Depends(get_session),
 ) -> InternalRagOut:
-    """Конфиг набора плюс проверка владения одним запросом."""
-    rag = await repo.get_rag(session, rag_id, user_id)
+    """Конфиг набора плюс проверка доступа одним запросом.
+
+    Чтение допускается для владельца и для shared/public наборов (общий
+    технический корпус). Запись этим вызовом не даётся.
+    """
+    rag = await repo.get_rag_for_read(session, rag_id, user_id)
     if rag is None:
         raise HTTPException(status_code=404, detail="Набор не найден")
 
@@ -41,6 +47,9 @@ async def internal_rag(
         id=rag.id,
         name=rag.name,
         status=counts.status,
+        kind=rag.kind,
+        visibility=rag.visibility,
+        index_name=rag.index_name,
         prompt=rag.prompt,
         temperature=rag.temperature,
         top_k=rag.top_k,
@@ -55,7 +64,9 @@ async def lookup_documents(
     session: AsyncSession = Depends(get_session),
 ) -> DocumentLookupOut:
     """Имена документов по идентификаторам — для подписей под цитатами."""
-    documents = await repo.documents_by_ids(session, payload.document_ids, user_id)
+    documents = await repo.documents_by_ids_for_read(
+        session, payload.document_ids, user_id
+    )
     return DocumentLookupOut(
         documents=[
             DocumentEntry(

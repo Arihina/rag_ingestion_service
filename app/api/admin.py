@@ -10,12 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import ImportBatch, RagSet, get_session
+from app.deps import require_internal_admin
 from app.schemas.rags import BatchOut
 from app.storage import ObjectStorage
 from app.tasks.conn import maintenance_queue
 from app.tasks.jobs import import_s3_prefix
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(
+    prefix="/admin", tags=["admin"],
+    dependencies=[Depends(require_internal_admin)],
+)
 
 
 class S3ImportRequest(BaseModel):

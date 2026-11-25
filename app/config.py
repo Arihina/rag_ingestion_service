@@ -3,6 +3,8 @@ from __future__ import annotations
 
 """Конфигурация сервиса. Префикс INGEST_, файл ingest.env."""
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +17,36 @@ class Settings(BaseSettings):
     port: int = 8011
     internal_port: int = 8012
     internal_host: str = "127.0.0.1"
+
+    env: str = "dev"
+
+    # Аутентификация платформенного порта 8011.
+    #   token     — проверять X-Internal-Token (секрет master),;
+    #   off       — доверять X-User-Id (только локальная разработка/тесты);
+    #   assertion — (подписанный X-Master-Assertion), ещё не реализован.
+    internal_auth_mode: Literal["off", "token", "assertion"] = "token"
+
+    # Per-agent секрет, которым master доказывает своё авторство
+    # (X-Internal-Token). Выдаётся master'ом, хранится только в env/secret.
+    # Никогда не попадает в agents.yaml/config/git/логи.
+    master_internal_token: str | None = None
+
+    # Пути без внутренней аутентификации. Только liveness, без данных.
+    # Точное совпадение (не startswith). ENV-значение — JSON-массив строк.
+    public_paths: tuple[str, ...] = ("/health",)
+
+    # Идентификатор агента — для логов и будущего aud в assertion.
+    agent_id: str = "rag_ingestion"
+
+    # Аварийный рубильник: разрешить internal_port=0 в prod. Штатно не
+    # использовать — тогда /embed и /v1/internal/* просто некому обслуживать.
+    allow_internal_on_public: bool = False
+
+    # Токены внутреннего порта 8012. Раздельные намеренно: /admin/* —
+    # операторский контур, /embed и /v1/internal/* — сервисный (agentic_rag,
+    # собственный воркер). Один общий токен на всё — нельзя.
+    internal_admin_token: str | None = None
+    internal_service_token: str | None = None
 
     reload: bool = False
     log_level: str = "info"

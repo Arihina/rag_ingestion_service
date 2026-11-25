@@ -12,13 +12,16 @@ from __future__ import annotations
 import asyncio
 from typing import Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.deps import require_internal_service
 from app.state import state
 
-router = APIRouter(tags=["embed"])
+router = APIRouter(
+    tags=["embed"], dependencies=[Depends(require_internal_service)]
+)
 
 
 class EmbedRequest(BaseModel):

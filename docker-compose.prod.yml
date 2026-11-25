@@ -1,7 +1,8 @@
 # Запуск: docker compose -f docker-compose.prod.yml up -d
 # Требует .env с DOCLING_KEY, OPENSEARCH_PASSWORD, DOCLING_IMAGE,
 # POSTGRES_PASSWORD, S3_ACCESS_KEY, S3_SECRET_KEY, INGEST_API_KEY,
-# INGEST_IMAGE_API, INGEST_IMAGE_WORKER.
+# INGEST_IMAGE_API, INGEST_IMAGE_WORKER, MASTER_INTERNAL_TOKEN,
+# INTERNAL_ADMIN_TOKEN, INTERNAL_SERVICE_TOKEN.
 #
 # Образы api и worker собираются в CI из одного Dockerfile двумя целями:
 #   docker build --target api    -t <registry>/rag-ingest-api:<tag> .
@@ -209,6 +210,14 @@ services:
       # Внутренний порт слушает 0.0.0.0, но НЕ публикуется на хост:
       # в сети compose до него дотягиваются воркеры, снаружи — никто.
       INGEST_INTERNAL_HOST: 0.0.0.0
+      INGEST_ENV: prod
+      INGEST_INTERNAL_AUTH_MODE: token
+      # Секрет, которым master доказывает авторство на платформенном порту.
+      # Должен совпадать с AGENT_INTERNAL_TOKENS["rag_ingestion"] на master.
+      INGEST_MASTER_INTERNAL_TOKEN: ${MASTER_INTERNAL_TOKEN:?required}
+      # Раздельные токены внутреннего порта 8012 (см. ingest.env.example).
+      INGEST_INTERNAL_ADMIN_TOKEN: ${INTERNAL_ADMIN_TOKEN:?required}
+      INGEST_INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?required}
       INGEST_DOCLING_URL: http://docling-api:5001
       INGEST_DOCLING_API_KEY: ${DOCLING_KEY}
       # upload, а не url: docling режет presigned-ссылки на приватные
@@ -275,6 +284,8 @@ services:
       INGEST_S3_ACCESS_KEY: ${S3_ACCESS_KEY}
       INGEST_S3_SECRET_KEY: ${S3_SECRET_KEY}
       INGEST_SELF_URL: http://api:8012
+      # Воркер ходит в /embed на внутреннем порту — нужен сервисный токен.
+      INGEST_INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?required}
     depends_on:
       api: { condition: service_started }
       redis: { condition: service_healthy }
