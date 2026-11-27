@@ -3,6 +3,7 @@ from __future__ import annotations
 
 """Конфигурация сервиса. Префикс INGEST_, файл ingest.env."""
 
+import uuid
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -47,6 +48,16 @@ class Settings(BaseSettings):
     # собственный воркер). Один общий токен на всё — нельзя.
     internal_admin_token: str | None = None
     internal_service_token: str | None = None
+
+    # Технический корпус PDF-статей (отдельный индекс, общий на отдел).
+    # id набора фиксируется в конфиге — его же знает tech_rag (TECH_RAG_ID).
+    # Если tech_rag_id не задан, /admin/techdocs/init сгенерирует id и вернёт
+    # его в ответе — зафиксируйте его в INGEST_TECH_RAG_ID.
+    tech_rag_id: uuid.UUID | None = None
+    # Системный владелец набора. Если не задан — all-zero UUID.
+    tech_owner_id: uuid.UUID | None = None
+    techdocs_index_name: str = "techdocs-v1"
+    techdocs_alias: str = "techdocs"
 
     reload: bool = False
     log_level: str = "info"
