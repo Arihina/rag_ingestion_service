@@ -58,3 +58,29 @@ INDEX_BODY: dict[str, Any] = {
         }
     },
 }
+
+
+# Технический корпус PDF-статей: та же основа (knn, sparse, ru_en), плюс
+# поля статьи для exact/фильтров и цитат. Отдельный индекс — граница
+# изоляции: tech_rag читает только techdocs-*, пользовательские наборы
+# остаются в kb-v2.
+TECHDOCS_INDEX_BODY: dict[str, Any] = {
+    "settings": INDEX_BODY["settings"],
+    "mappings": {
+        "properties": {
+            **INDEX_BODY["mappings"]["properties"],
+            "doc_type": {"type": "keyword"},
+            "title": {
+                "type": "text",
+                "analyzer": "ru_en",
+                "fields": {"keyword": {"type": "keyword", "ignore_above": 512}},
+            },
+            "authors": {"type": "keyword"},
+            "year": {"type": "integer"},
+            "doi": {"type": "keyword"},
+            "abstract": {"type": "text", "analyzer": "ru_en"},
+            "filename": {"type": "keyword"},
+            "chunk_kind": {"type": "keyword"},
+        }
+    },
+}
